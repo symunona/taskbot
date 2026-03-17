@@ -1,0 +1,4 @@
+listen_addr = "0.0.0.0:8080"
+vault_path = "/home/symunona/hermes-knowledge-base"
+token = "8cdef62a-2935-408a-81d7-e9fb9c5129c6"
+public_domain = "hermes.c.tmpx.space"

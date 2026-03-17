@@ -1,0 +1,24 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches/build_file_checksums.ser
+/.idea/workspace.xml
+/.idea/libraries
+/.idea/modules.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+/androidApp/build
+/app/build
+/server/target
+build/
+*.db
+*.log
+*.sqlite
+node_modules/
+
+# Dolt database files (added by bd init)
+.dolt/

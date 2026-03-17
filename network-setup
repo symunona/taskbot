@@ -1,0 +1,358 @@
+#!/bin/bash
+set -e
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+echo "========================================"
+echo -e "${BLUE}Hermes Network Setup Subsystem${NC}"
+echo "========================================"
+
+CONFIG_FILE="$(dirname "${BASH_SOURCE[0]}")/server/config.toml"
+CONFIG_DOMAIN=""
+CONFIG_VAULT=""
+CONFIG_PORT=""
+
+if [ -f "$CONFIG_FILE" ]; then
+    CONFIG_DOMAIN=$(awk -F'"' '/^public_domain/ {print $2}' "$CONFIG_FILE" || true)
+    CONFIG_VAULT=$(awk -F'"' '/^vault_path/ {print $2}' "$CONFIG_FILE" || true)
+    CONFIG_PORT=$(awk -F'"' '/^listen_addr/ {print $2}' "$CONFIG_FILE" | awk -F':' '{print $2}' || true)
+fi
+
+# 1. Knowledge Base Setup
+echo ""
+echo "========================================"
+echo -e "${BLUE}Knowledge Base Setup${NC}"
+echo "========================================"
+
+if [ -n "$CONFIG_VAULT" ]; then
+    echo -e "${GREEN}[✓] Knowledge Base path already configured in ${BLUE}$(basename "$CONFIG_FILE")${GREEN}: $CONFIG_VAULT${NC}"
+    KB_PATH="$CONFIG_VAULT"
+else
+    echo -e "${YELLOW}[!] Knowledge Base path not configured.${NC}"
+    read -p "Enter the root path for your knowledge base (default: ./vault): " INPUT_KB_PATH
+    KB_PATH=${INPUT_KB_PATH:-./vault}
+fi
+
+mkdir -p "$KB_PATH"
+KB_PATH=$(realpath "$KB_PATH")
+echo -e "Knowledge base set to: ${GREEN}$KB_PATH${NC}"
+
+if [ -d "$KB_PATH/.git" ]; then
+    echo -e "${GREEN}[✓] Git repository already exists in the knowledge base.${NC}"
+else
+    echo -e "${YELLOW}[!] Git repository not found in knowledge base.${NC}"
+    read -p "Do you want to initialize a Git repository in your knowledge base? (y/n): " INIT_GIT
+    if [ "$INIT_GIT" = "y" ]; then
+        read -p "Do you already have a remote repository URL? (y/n, default: n): " HAS_REMOTE
+        if [ "$HAS_REMOTE" = "y" ]; then
+            read -p "Enter the remote URL: " REMOTE_URL
+            git clone "$REMOTE_URL" "$KB_PATH" || echo -e "${RED}Clone failed, initializing locally...${NC}"
+        fi
+        
+        if [ ! -d "$KB_PATH/.git" ]; then
+            cd "$KB_PATH"
+            git init
+            echo -e "${GREEN}Git repository initialized.${NC}"
+            cd - > /dev/null
+        fi
+    fi
+fi
+
+# 1.5 Port Setup
+echo ""
+echo "========================================"
+echo -e "${BLUE}Port Setup${NC}"
+echo "========================================"
+
+if [ -n "$CONFIG_PORT" ]; then
+    echo -e "${GREEN}[✓] Port already configured in ${BLUE}$(basename "$CONFIG_FILE")${GREEN}: $CONFIG_PORT${NC}"
+    APP_PORT="$CONFIG_PORT"
+else
+    echo -e "${YELLOW}[!] Port not configured.${NC}"
+    read -p "Enter the port for Hermes server to listen on (default: 55566): " INPUT_PORT
+    APP_PORT=${INPUT_PORT:-55566}
+    echo -e "Port set to: ${GREEN}$APP_PORT${NC}"
+fi
+
+# 2. Nginx Check & Domain Configuration
+echo ""
+echo "========================================"
+echo -e "${BLUE}Network & Domain Setup${NC}"
+echo "========================================"
+
+DOMAIN_NAME="$CONFIG_DOMAIN"
+
+if [ -n "$DOMAIN_NAME" ]; then
+    echo -e "${GREEN}[✓] Domain already configured in ${BLUE}$(basename "$CONFIG_FILE")${GREEN}: $DOMAIN_NAME${NC}"
+else
+    echo -e "${YELLOW}[!] Domain not configured.${NC}"
+fi
+
+if ! command -v nginx >/dev/null 2>&1; then
+    echo -e "${YELLOW}[!] Nginx is not installed.${NC}"
+    read -p "Install it now? (y/n): " INSTALL_NGINX
+    if [ "$INSTALL_NGINX" = "y" ]; then
+        sudo apt-get update && sudo apt-get install -y nginx
+    fi
+else
+    echo -e "${GREEN}[✓] Nginx is installed.${NC}"
+fi
+
+if command -v nginx >/dev/null 2>&1; then
+    if [ -z "$DOMAIN_NAME" ]; then
+        # Try to dig domain out of nginx config
+        if [ -f "/etc/nginx/sites-enabled/hermes" ]; then
+            NGINX_DOMAIN=$(grep -oP 'server_name\s+\K[^;]+' /etc/nginx/sites-enabled/hermes | head -n 1)
+            if [ -n "$NGINX_DOMAIN" ]; then
+                echo -e "${GREEN}[✓] Found existing domain in Nginx config: $NGINX_DOMAIN${NC}"
+                DOMAIN_NAME="$NGINX_DOMAIN"
+            fi
+        fi
+    fi
+
+    if [ -z "$DOMAIN_NAME" ]; then
+        read -p "Do you want to configure Nginx for a domain/subdomain? (y/n): " CONFIG_NGINX
+        if [ "$CONFIG_NGINX" = "y" ]; then
+            read -p "Enter your domain/subdomain (e.g., hermes.example.com): " DOMAIN_NAME
+            
+            NGINX_CONF="/etc/nginx/sites-available/hermes"
+            echo "Creating Nginx configuration for $DOMAIN_NAME..."
+            sudo bash -c "cat << 'CONF' > $NGINX_CONF
+server {
+    listen 80;
+    server_name $DOMAIN_NAME;
+
+    location / {
+        if (\$http_upgrade != \"websocket\") {
+            add_header Content-Type text/html;
+            return 200 '<html><head><title>Hermes</title></head><body style=\"background-color: #111; color: #555; display: flex; justify-content: center; align-items: center; height: 100vh; font-family: sans-serif;\"><h1>Hermes TX Node Active</h1></body></html>';
+        }
+        proxy_pass http://127.0.0.1:$APP_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+    }
+}
+CONF"
+            if [ ! -f "/etc/nginx/sites-enabled/hermes" ]; then
+                sudo ln -s $NGINX_CONF /etc/nginx/sites-enabled/
+            fi
+            sudo nginx -t && sudo systemctl reload nginx
+            echo -e "${GREEN}Nginx configured for $DOMAIN_NAME.${NC}"
+        fi
+    else
+        if [ ! -f "/etc/nginx/sites-available/hermes" ]; then
+            echo -e "${YELLOW}[!] Nginx configuration for Hermes not found, but domain is $DOMAIN_NAME.${NC}"
+            read -p "Create Nginx config for $DOMAIN_NAME? (y/n): " CREATE_NGINX
+            if [ "$CREATE_NGINX" = "y" ]; then
+                NGINX_CONF="/etc/nginx/sites-available/hermes"
+                sudo bash -c "cat << 'CONF' > $NGINX_CONF
+server {
+    listen 80;
+    server_name $DOMAIN_NAME;
+
+    location / {
+        if (\$http_upgrade != \"websocket\") {
+            add_header Content-Type text/html;
+            return 200 '<html><head><title>Hermes</title></head><body style=\"background-color: #111; color: #555; display: flex; justify-content: center; align-items: center; height: 100vh; font-family: sans-serif;\"><h1>Hermes TX Node Active</h1></body></html>';
+        }
+        proxy_pass http://127.0.0.1:$APP_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+    }
+}
+CONF"
+                if [ ! -f "/etc/nginx/sites-enabled/hermes" ]; then
+                    sudo ln -s $NGINX_CONF /etc/nginx/sites-enabled/
+                fi
+                sudo nginx -t && sudo systemctl reload nginx
+                echo -e "${GREEN}Nginx configured for $DOMAIN_NAME.${NC}"
+            fi
+        else
+            echo -e "${GREEN}[✓] Nginx configuration for Hermes exists.${NC}"
+        fi
+    fi
+fi
+
+if [ -z "$DOMAIN_NAME" ]; then
+    echo -e "${YELLOW}[!] No domain configured.${NC}"
+    read -p "Enter a public address (domain or IP) for the app (default: localhost): " INPUT_DOMAIN
+    DOMAIN_NAME=${INPUT_DOMAIN:-localhost}
+fi
+
+# 3. Certbot Check
+if [ -n "$DOMAIN_NAME" ] && [ "$DOMAIN_NAME" != "localhost" ] && command -v nginx >/dev/null 2>&1; then
+    echo ""
+    echo -e "${BLUE}[*] Checking Certbot (SSL) configuration...${NC}"
+    if ! command -v certbot >/dev/null 2>&1; then
+        echo -e "${YELLOW}[!] Certbot is not installed.${NC}"
+        read -p "Install it now? (y/n): " INSTALL_CERTBOT
+        if [ "$INSTALL_CERTBOT" = "y" ]; then
+            sudo apt-get update && sudo apt-get install -y certbot python3-certbot-nginx
+        fi
+    else
+        echo -e "${GREEN}[✓] Certbot is installed.${NC}"
+    fi
+    
+    if command -v certbot >/dev/null 2>&1; then
+        if sudo certbot certificates 2>/dev/null | grep -q "$DOMAIN_NAME"; then
+            echo -e "${GREEN}[✓] SSL Certificate already exists for $DOMAIN_NAME.${NC}"
+        else
+            echo -e "${YELLOW}[!] No SSL Certificate found for $DOMAIN_NAME.${NC}"
+            read -p "Do you want to run Certbot to secure $DOMAIN_NAME? (y/n): " RUN_CERTBOT
+            if [ "$RUN_CERTBOT" = "y" ]; then
+                sudo certbot --nginx -d $DOMAIN_NAME
+            fi
+        fi
+    fi
+fi
+
+# 4. UFW Check
+echo ""
+echo -e "${BLUE}[*] Checking UFW (Uncomplicated Firewall) settings...${NC}"
+if command -v ufw >/dev/null 2>&1; then
+    UFW_STATUS=$(sudo ufw status | grep "Status" | awk '{print $2}')
+    if [ "$UFW_STATUS" = "active" ]; then
+        echo -e "${GREEN}[✓] UFW is active.${NC}"
+        if ! sudo ufw status | grep -q "$APP_PORT"; then
+            echo -e "${YELLOW}[!] Port $APP_PORT is not allowed. Allowing now...${NC}"
+            sudo ufw allow $APP_PORT/tcp
+            sudo ufw allow $APP_PORT/udp
+            echo -e "${GREEN}Port $APP_PORT allowed.${NC}"
+        else
+            echo -e "${GREEN}[✓] Port $APP_PORT is already allowed.${NC}"
+        fi
+        
+        if ! sudo ufw status | grep -q "80"; then
+            sudo ufw allow 80/tcp
+        fi
+        if ! sudo ufw status | grep -q "443"; then
+            sudo ufw allow 443/tcp
+        fi
+    else
+        echo -e "${YELLOW}[!] UFW is inactive. Skipping firewall configuration.${NC}"
+    fi
+else
+    echo -e "${YELLOW}[!] UFW is not installed. Skipping.${NC}"
+fi
+
+# 5. Fail2Ban Check
+echo ""
+echo -e "${BLUE}[*] Checking Fail2Ban configuration...${NC}"
+if ! command -v fail2ban-client >/dev/null 2>&1; then
+    echo -e "${YELLOW}[!] Fail2Ban is not installed.${NC}"
+    read -p "Install it now? (y/n): " INSTALL_F2B
+    if [ "$INSTALL_F2B" = "y" ]; then
+        sudo apt-get update && sudo apt-get install -y fail2ban
+        sudo systemctl enable fail2ban
+        sudo systemctl start fail2ban
+        echo -e "${GREEN}Fail2Ban installed and started.${NC}"
+    fi
+else
+    echo -e "${GREEN}[✓] Fail2Ban is already installed.${NC}"
+fi
+
+# Save settings to config.toml
+echo ""
+echo -e "${BLUE}[*] Updating config.toml...${NC}"
+if [ ! -f "$CONFIG_FILE" ]; then
+    # Default config structure if missing
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat << CONF > "$CONFIG_FILE"
+listen_addr = "0.0.0.0:$APP_PORT"
+vault_path = "$KB_PATH"
+token = "$(uuidgen 2>/dev/null || echo 'default-token-replace-me')"
+public_domain = "$DOMAIN_NAME"
+CONF
+    echo -e "${GREEN}Created new config at $(basename "$CONFIG_FILE")${NC}"
+else
+    # Update listen_addr
+    if grep -q "listen_addr" "$CONFIG_FILE"; then
+        sed -i "s|listen_addr = .*|listen_addr = \"0.0.0.0:$APP_PORT\"|" "$CONFIG_FILE"
+    else
+        echo "listen_addr = \"0.0.0.0:$APP_PORT\"" >> "$CONFIG_FILE"
+    fi
+    
+    # Update vault_path
+    if grep -q "vault_path" "$CONFIG_FILE"; then
+        sed -i "s|vault_path = .*|vault_path = \"$KB_PATH\"|" "$CONFIG_FILE"
+    else
+        echo "vault_path = \"$KB_PATH\"" >> "$CONFIG_FILE"
+    fi
+    
+    # Update public_domain
+    if grep -q "public_domain" "$CONFIG_FILE"; then
+        sed -i "s|public_domain = .*|public_domain = \"$DOMAIN_NAME\"|" "$CONFIG_FILE"
+    else
+        echo "public_domain = \"$DOMAIN_NAME\"" >> "$CONFIG_FILE"
+    fi
+    echo -e "${GREEN}Updated config at $(basename "$CONFIG_FILE")${NC}"
+fi
+
+# 6. Final Checks
+echo ""
+echo "========================================"
+echo -e "${BLUE}Performing Final Checks...${NC}"
+echo "========================================"
+
+CHECK_PASSED=true
+
+# Check Vault
+if [ -d "$KB_PATH" ]; then
+    echo -e "${GREEN}[PASS] Knowledge Base directory exists: $KB_PATH${NC}"
+else
+    echo -e "${RED}[FAIL] Knowledge Base directory missing: $KB_PATH${NC}"
+    CHECK_PASSED=false
+fi
+
+# Check Nginx
+if command -v nginx >/dev/null 2>&1; then
+    if sudo nginx -t 2>/dev/null; then
+        echo -e "${GREEN}[PASS] Nginx configuration is valid.${NC}"
+    else
+        echo -e "${RED}[FAIL] Nginx configuration has errors.${NC}"
+        CHECK_PASSED=false
+    fi
+else
+    echo -e "${YELLOW}[WARN] Nginx is not installed.${NC}"
+fi
+
+# Check Domain Config
+if [ -n "$DOMAIN_NAME" ] && [ "$DOMAIN_NAME" != "localhost" ]; then
+    echo -e "${GREEN}[PASS] Domain is configured: $DOMAIN_NAME${NC}"
+else
+    echo -e "${YELLOW}[WARN] Domain is not configured (using localhost).${NC}"
+fi
+
+# Check UFW
+if command -v ufw >/dev/null 2>&1; then
+    UFW_STATUS=$(sudo ufw status | grep "Status" | awk '{print $2}')
+    if [ "$UFW_STATUS" = "active" ]; then
+        if sudo ufw status | grep -q "$APP_PORT"; then
+            echo -e "${GREEN}[PASS] Firewall allows port $APP_PORT.${NC}"
+        else
+            echo -e "${RED}[FAIL] Firewall does not allow port $APP_PORT.${NC}"
+            CHECK_PASSED=false
+        fi
+    else
+        echo -e "${YELLOW}[WARN] Firewall is inactive.${NC}"
+    fi
+else
+    echo -e "${YELLOW}[WARN] UFW is not installed.${NC}"
+fi
+
+echo "========================================"
+if [ "$CHECK_PASSED" = true ]; then
+    echo -e "${GREEN}All checks passed! Network setup complete!${NC}"
+else
+    echo -e "${RED}Some checks failed. Please review the output above.${NC}"
+fi
+echo "========================================"
