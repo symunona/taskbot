@@ -1141,6 +1141,8 @@ fun ChatScreen(
                             try {
                                 session.start()
                             } catch (e: Throwable) {
+                                EventLogger.log("Voice session failed to start: ${e.message ?: "Unknown error"}", isError = true)
+                                e.printStackTrace()
                                 messages = messages + ChatMessage(
                                     "model",
                                     "Voice session failed to start: ${e.message ?: "Unknown error"}",

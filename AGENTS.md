@@ -24,6 +24,33 @@ The default command and build runner for the Rust backend is **Cargo** (`cargo`)
 - Do not ignore linter warnings; fix them using `cargo clippy --fix` or manually apply the suggested changes before finishing the task.
 - Before calling a feature DONE, always do a local build to make sure it worked.
 
+## Android App (`androidApp/`)
+
+### Skill: Android Test Cycle
+
+When debugging or testing the Android app, use this concise sequence to ensure a clean test cycle:
+
+1. **Build and Install**: Compile and push the debug APK to the connected device/emulator.
+   ```bash
+   ./gradlew installDebug
+   ```
+2. **Clear Logs**: Clear the previous logcat buffer to avoid noise.
+   ```bash
+   adb logcat -c
+   ```
+3. **Start the App**: Launch the main activity.
+   ```bash
+   adb shell am start -n com.hermes.android/com.hermes.android.MainActivity
+   ```
+4. **Interact (Optional)**: Find coordinates of UI elements and simulate taps (e.g., Voice toggle).
+   ```bash
+   adb shell uiautomator dump && adb shell cat /sdcard/window_dump.xml | grep -o 'content-desc="Toggle Voice"[^>]*'
+   adb shell input tap <x> <y>
+   ```
+5. **Capture Logs**: Extract logs for analysis (filtering by specific tags like `EventLogger` or `Exception`).
+   ```bash
+   adb logcat -d | grep -i "EventLogger"
+   ```
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:full hash:d4f96305 -->
 ## Issue Tracking with bd (beads)

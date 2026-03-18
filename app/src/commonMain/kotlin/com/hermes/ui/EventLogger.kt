@@ -12,6 +12,7 @@ object EventLogger {
     val logs: StateFlow<List<LogEvent>> = _logs.asStateFlow()
 
     fun log(message: String, isError: Boolean = false) {
+        println("EventLogger: $message")
         val event = LogEvent(Clock.System.now().toEpochMilliseconds(), message, isError)
         _logs.value = _logs.value + event
     }

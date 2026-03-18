@@ -50,7 +50,7 @@ class GeminiLiveClient(private val apiKey: String) {
     val incomingMessages: SharedFlow<JsonObject> = _incomingMessages
 
     suspend fun connect(systemInstruction: String? = null, tools: JsonArray? = null) {
-        val url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
+        val url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=$apiKey"
         EventLogger.log("Connecting Gemini Live session")
         session = client.webSocketSession(url)
         setupComplete = CompletableDeferred()
@@ -60,9 +60,11 @@ class GeminiLiveClient(private val apiKey: String) {
             try {
                 for (frame in session!!.incoming) {
                     if (frame !is Frame.Text) {
+                        EventLogger.log("Gemini Live non-text frame received: ${frame.frameType}")
                         continue
                     }
                     val payload = frame.readText()
+                    EventLogger.log("Gemini Live raw message: $payload")
                     val message = json.parseToJsonElement(payload).jsonObject
                     when {
                         message["setupComplete"] != null -> {
@@ -88,6 +90,8 @@ class GeminiLiveClient(private val apiKey: String) {
                     }
                     _incomingMessages.emit(message)
                 }
+                val reason = session?.closeReason?.await()
+                EventLogger.log("Gemini Live incoming channel closed normally. Reason: $reason")
             } catch (e: Exception) {
                 if (!setupComplete.isCompleted) {
                     setupComplete.completeExceptionally(e)
@@ -98,23 +102,9 @@ class GeminiLiveClient(private val apiKey: String) {
 
         val setupMessage = buildJsonObject {
             put("setup", buildJsonObject {
-                put("model", "models/gemini-2.5-flash-native-audio-preview-12-2025")
+                put("model", "models/gemini-2.0-flash-exp")
                 put("generationConfig", buildJsonObject {
                     put("responseModalities", buildJsonArray { add(JsonPrimitive("AUDIO")) })
-                })
-                put("speechConfig", buildJsonObject {
-                    put("voiceConfig", buildJsonObject {
-                        put("prebuiltVoiceConfig", buildJsonObject {
-                            put("voiceName", "Kore")
-                        })
-                    })
-                })
-                put("inputAudioTranscription", buildJsonObject {})
-                put("outputAudioTranscription", buildJsonObject {})
-                put("realtimeInputConfig", buildJsonObject {
-                    put("automaticActivityDetection", buildJsonObject {
-                        put("disabled", false)
-                    })
                 })
                 if (systemInstruction != null) {
                     put("systemInstruction", buildJsonObject {
