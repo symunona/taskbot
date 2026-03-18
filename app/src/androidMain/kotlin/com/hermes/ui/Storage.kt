@@ -2,6 +2,7 @@ package com.hermes.ui
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.widget.Toast
 
 object AndroidStorage {
     var context: Context? = null
@@ -20,3 +21,9 @@ class AndroidKeyValueStorage : KeyValueStorage {
 }
 
 actual fun getStorage(): KeyValueStorage = AndroidKeyValueStorage()
+
+actual fun showPlatformToast(message: String) {
+    AndroidStorage.context?.let { context ->
+        Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+    }
+}

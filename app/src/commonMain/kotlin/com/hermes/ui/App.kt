@@ -24,7 +24,8 @@ import com.hermes.connection.*
 import com.hermes.llm.*
 import com.hermes.tools.*
 import com.hermes.voice.VoiceSession
-import com.hermes.voice.VoiceManager
+import com.hermes.voice.VoiceTranscript
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
@@ -41,13 +42,55 @@ interface KeyValueStorage {
 }
 
 expect fun getStorage(): KeyValueStorage
+expect fun showPlatformToast(message: String)
 
 enum class AppScreen {
     CHAT, SETTINGS, LOGS
 }
 
-data class ChatMessage(val role: String, val content: String, val isToolResult: Boolean = false)
+data class ChatMessage(
+    val role: String,
+    val content: String,
+    val isToolResult: Boolean = false,
+    val isVoiceTranscript: Boolean = false,
+    val isVoicePartial: Boolean = false
+)
 data class ThreadInfo(val id: String, val summary: String)
+
+private fun upsertVoiceTranscript(messages: List<ChatMessage>, transcript: VoiceTranscript): List<ChatMessage> {
+    val normalizedText = transcript.text.trim()
+    if (normalizedText.isBlank()) {
+        return messages
+    }
+
+    val lastMessage = messages.lastOrNull()
+    val shouldReplaceLastTranscript = lastMessage?.isVoiceTranscript == true &&
+        lastMessage.role == transcript.role &&
+        (
+            lastMessage.isVoicePartial ||
+                transcript.isPartial ||
+                normalizedText.startsWith(lastMessage.content) ||
+                lastMessage.content.startsWith(normalizedText)
+        )
+
+    if (shouldReplaceLastTranscript) {
+        val existingMessage = lastMessage ?: return messages
+        if (existingMessage.content == normalizedText && existingMessage.isVoicePartial == transcript.isPartial) {
+            return messages
+        }
+        return messages.dropLast(1) + existingMessage.copy(
+            content = normalizedText,
+            isVoicePartial = transcript.isPartial
+        )
+    }
+
+    return messages + ChatMessage(
+        role = transcript.role,
+        content = normalizedText,
+        isVoiceTranscript = true,
+        isVoicePartial = transcript.isPartial
+    )
+}
 
 @Composable
 fun App() {
@@ -182,7 +225,7 @@ fun MainAppScreen(
 ) {
     val connectionManager = remember { ConnectionManager() }
     val connectionState by connectionManager.webSocketClient.connectionState.collectAsState()
-    var isKeyFetched by remember { mutableStateOf(apiKey.isNotEmpty()) }
+    var attemptedRemoteApiKeyFetch by remember { mutableStateOf(apiKey.isNotEmpty()) }
 
     val scaffoldState = rememberScaffoldState()
     val coroutineScope = rememberCoroutineScope()
@@ -223,12 +266,20 @@ fun MainAppScreen(
         }
     }
     LaunchedEffect(currentThreadId) {
-        if (currentThreadId != null) {
-            storage.setString("last_thread_id", currentThreadId!!)
+        val selectedThreadId = currentThreadId
+        if (selectedThreadId != null) {
+            storage.setString("last_thread_id", selectedThreadId)
+        }
+    }
+
+    LaunchedEffect(apiKey) {
+        if (apiKey.isNotBlank()) {
+            attemptedRemoteApiKeyFetch = true
         }
     }
 
     LaunchedEffect(connectionString) {
+        attemptedRemoteApiKeyFetch = apiKey.isNotBlank()
         if (connectionString.isNotEmpty()) {
             connectionManager.connectFromString(connectionString)
         } else {
@@ -236,8 +287,13 @@ fun MainAppScreen(
         }
     }
     
-    LaunchedEffect(connectionState) {
-        if (connectionState == com.hermes.connection.WebSocketClient.ConnectionState.Connected && apiKey.isEmpty() && !isKeyFetched) {
+    LaunchedEffect(connectionState, apiKey, attemptedRemoteApiKeyFetch) {
+        if (
+            connectionState == com.hermes.connection.WebSocketClient.ConnectionState.Connected &&
+            apiKey.isEmpty() &&
+            !attemptedRemoteApiKeyFetch
+        ) {
+            attemptedRemoteApiKeyFetch = true
             val reqId = "req_${kotlin.random.Random.nextInt()}"
             connectionManager.webSocketClient.send(buildJsonObject {
                 put("event", "system.config.get")
@@ -253,172 +309,165 @@ fun MainAppScreen(
             val fetchedKey = res?.get("payload")?.jsonObject?.get("google_api_key")?.jsonPrimitive?.contentOrNull
             if (!fetchedKey.isNullOrEmpty()) {
                 onApiKeyReceived(fetchedKey)
-                isKeyFetched = true
             }
         }
     }
 
-    if (!isKeyFetched) {
-        if (connectionState == com.hermes.connection.WebSocketClient.ConnectionState.Connecting) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("Connecting to Hermes...")
-            }
-        } else {
-            ApiKeyScreen(onKeySubmit = { onApiKeyReceived(it); isKeyFetched = true })
-        }
-    } else {
-        Scaffold(
-            scaffoldState = scaffoldState,
-            topBar = {
-                TopAppBar(
-                    title = { Text("Hermes") },
-                    navigationIcon = {
-                        IconButton(onClick = { coroutineScope.launch { scaffoldState.drawerState.open() } }) {
-                            Icon(Icons.Filled.Menu, contentDescription = "Menu")
-                        }
+    Scaffold(
+        scaffoldState = scaffoldState,
+        topBar = {
+            TopAppBar(
+                title = { Text("Hermes") },
+                navigationIcon = {
+                    IconButton(onClick = { coroutineScope.launch { scaffoldState.drawerState.open() } }) {
+                        Icon(Icons.Filled.Menu, contentDescription = "Menu")
                     }
+                }
+            )
+        },
+        drawerContent = {
+            Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                Text("Menu", style = MaterialTheme.typography.h6)
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    "Chat",
+                    modifier = Modifier.fillMaxWidth().clickable {
+                        currentScreen = AppScreen.CHAT
+                        coroutineScope.launch { scaffoldState.drawerState.close() }
+                    }.padding(vertical = 8.dp)
                 )
-            },
-            drawerContent = {
-                Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    Text("Menu", style = MaterialTheme.typography.h6)
-                    Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    "Settings",
+                    modifier = Modifier.fillMaxWidth().clickable {
+                        currentScreen = AppScreen.SETTINGS
+                        coroutineScope.launch { scaffoldState.drawerState.close() }
+                    }.padding(vertical = 8.dp)
+                )
+                Text(
+                    "Logs",
+                    modifier = Modifier.fillMaxWidth().clickable {
+                        currentScreen = AppScreen.LOGS
+                        coroutineScope.launch { scaffoldState.drawerState.close() }
+                    }.padding(vertical = 8.dp)
+                )
+                
+                Spacer(modifier = Modifier.height(24.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Threads", style = MaterialTheme.typography.subtitle1, color = Color.Gray)
                     Text(
-                        "Chat",
-                        modifier = Modifier.fillMaxWidth().clickable {
+                        "+ New",
+                        color = MaterialTheme.colors.primary,
+                        modifier = Modifier.clickable {
+                            currentThreadId = null
                             currentScreen = AppScreen.CHAT
                             coroutineScope.launch { scaffoldState.drawerState.close() }
-                        }.padding(vertical = 8.dp)
+                        }.padding(4.dp)
                     )
-                    Text(
-                        "Settings",
-                        modifier = Modifier.fillMaxWidth().clickable {
-                            currentScreen = AppScreen.SETTINGS
+                }
+                Divider(color = Color.DarkGray, modifier = Modifier.padding(vertical = 8.dp))
+                LazyColumn(modifier = Modifier.weight(1f)) {
+                    items(threads) { thread ->
+                        val isActive = thread.id == currentThreadId
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    currentThreadId = thread.id
+                                    currentScreen = AppScreen.CHAT
+                                    coroutineScope.launch { scaffoldState.drawerState.close() }
+                                }
+                                .background(if (isActive) Color(0xFF4D4D4D) else Color.Transparent)
+                                .padding(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(thread.summary, color = Color.White, modifier = Modifier.weight(1f))
+                            Text("x", color = Color.Gray, modifier = Modifier.clickable {
+                                coroutineScope.launch {
+                                    val reqId = "req_${kotlin.random.Random.nextInt()}"
+                                    connectionManager.webSocketClient.send(buildJsonObject {
+                                        put("event", "thread.close")
+                                        put("id", reqId)
+                                        put("ts", 0)
+                                        put("payload", buildJsonObject { put("thread_id", thread.id) })
+                                    })
+                                    threads = threads.filter { it.id != thread.id }
+                                    if (currentThreadId == thread.id) {
+                                        currentThreadId = threads.firstOrNull()?.id
+                                    }
+                                }
+                            })
+                        }
+                    }
+                }
+                
+                val statusText = when (connectionState) {
+                    com.hermes.connection.WebSocketClient.ConnectionState.Connected -> "Connected"
+                    com.hermes.connection.WebSocketClient.ConnectionState.Connecting -> "Connecting..."
+                    com.hermes.connection.WebSocketClient.ConnectionState.Error -> "Error"
+                    com.hermes.connection.WebSocketClient.ConnectionState.Disconnected -> "Standalone / Disconnected"
+                }
+                val statusColor = when (connectionState) {
+                    com.hermes.connection.WebSocketClient.ConnectionState.Connected -> Color.Green
+                    com.hermes.connection.WebSocketClient.ConnectionState.Connecting -> Color.Yellow
+                    com.hermes.connection.WebSocketClient.ConnectionState.Error -> Color.Red
+                    com.hermes.connection.WebSocketClient.ConnectionState.Disconnected -> Color.Gray
+                }
+                Text("Status: $statusText", color = statusColor)
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                if (connectionString.isNotEmpty()) {
+                    Button(
+                        onClick = {
+                            onDisconnect()
                             coroutineScope.launch { scaffoldState.drawerState.close() }
-                        }.padding(vertical = 8.dp)
-                    )
-                    Text(
-                        "Logs",
-                        modifier = Modifier.fillMaxWidth().clickable {
-                            currentScreen = AppScreen.LOGS
-                            coroutineScope.launch { scaffoldState.drawerState.close() }
-                        }.padding(vertical = 8.dp)
-                    )
-                    
-                    Spacer(modifier = Modifier.height(24.dp))
-                    Row(
-                        modifier = Modifier.weight(1f),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(backgroundColor = Color.DarkGray)
                     ) {
-                        Text("Threads", style = MaterialTheme.typography.subtitle1, color = Color.Gray)
-                        Text(
-                            "+ New",
-                            color = MaterialTheme.colors.primary,
-                            modifier = Modifier.clickable {
-                                currentThreadId = null
-                                currentScreen = AppScreen.CHAT
-                                coroutineScope.launch { scaffoldState.drawerState.close() }
-                            }.padding(4.dp)
-                        )
+                        Text("Disconnect", color = Color.White)
                     }
-                    Divider(color = Color.DarkGray, modifier = Modifier.padding(vertical = 8.dp))
-                    LazyColumn(modifier = Modifier.weight(1f)) {
-                        items(threads) { thread ->
-                            val isActive = thread.id == currentThreadId
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        currentThreadId = thread.id
-                                        currentScreen = AppScreen.CHAT
-                                        coroutineScope.launch { scaffoldState.drawerState.close() }
-                                    }
-                                    .background(if (isActive) Color(0xFF4D4D4D) else Color.Transparent)
-                                    .padding(8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(thread.summary, color = Color.White, modifier = Modifier.weight(1f))
-                                Text("x", color = Color.Gray, modifier = Modifier.clickable {
-                                    coroutineScope.launch {
-                                        val reqId = "req_${kotlin.random.Random.nextInt()}"
-                                        connectionManager.webSocketClient.send(buildJsonObject {
-                                            put("event", "thread.close")
-                                            put("id", reqId)
-                                            put("ts", 0)
-                                            put("payload", buildJsonObject { put("thread_id", thread.id) })
-                                        })
-                                        threads = threads.filter { it.id != thread.id }
-                                        if (currentThreadId == thread.id) {
-                                            currentThreadId = threads.firstOrNull()?.id
-                                        }
-                                    }
-                                })
-                            }
-                        }
-                    }
-                    
-                    val statusText = when (connectionState) {
-                        com.hermes.connection.WebSocketClient.ConnectionState.Connected -> "Connected"
-                        com.hermes.connection.WebSocketClient.ConnectionState.Connecting -> "Connecting..."
-                        com.hermes.connection.WebSocketClient.ConnectionState.Error -> "Error"
-                        com.hermes.connection.WebSocketClient.ConnectionState.Disconnected -> "Standalone / Disconnected"
-                    }
-                    val statusColor = when (connectionState) {
-                        com.hermes.connection.WebSocketClient.ConnectionState.Connected -> Color.Green
-                        com.hermes.connection.WebSocketClient.ConnectionState.Connecting -> Color.Yellow
-                        com.hermes.connection.WebSocketClient.ConnectionState.Error -> Color.Red
-                        com.hermes.connection.WebSocketClient.ConnectionState.Disconnected -> Color.Gray
-                    }
-                    Text("Status: $statusText", color = statusColor)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    
-                    if (connectionString.isNotEmpty()) {
-                        Button(
-                            onClick = {
-                                onDisconnect()
-                                coroutineScope.launch { scaffoldState.drawerState.close() }
-                            },
-                            modifier = Modifier.weight(1f),
-                            colors = ButtonDefaults.buttonColors(backgroundColor = Color.DarkGray)
-                        ) {
-                            Text("Disconnect", color = Color.White)
-                        }
-                    } else {
-                        Button(
-                            onClick = {
-                                onOpenConnectionScreen()
-                                coroutineScope.launch { scaffoldState.drawerState.close() }
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Pair Device")
-                        }
+                } else {
+                    Button(
+                        onClick = {
+                            onOpenConnectionScreen()
+                            coroutineScope.launch { scaffoldState.drawerState.close() }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Pair Device")
                     }
                 }
             }
-        ) { paddingValues ->
-            Box(modifier = Modifier.padding(paddingValues).fillMaxSize()) {
-                when (currentScreen) {
-                    AppScreen.CHAT -> ChatScreen(
-                        apiKey = apiKey,
-                        connectionManager = connectionManager,
-                        storage = storage,
-                        newThreadEvent = newThreadEvent,
-                        threads = threads,
-                        onThreadsChange = { threads = it },
-                        currentThreadId = currentThreadId,
-                        onCurrentThreadIdChange = { currentThreadId = it }
-                    )
-                    AppScreen.SETTINGS -> SettingsScreen(
-                        apiKey = apiKey,
-                        connectionString = connectionString,
-                        connectionState = connectionState,
-                        onConnectionStringChanged = onConnectionStringChanged,
-                        onOpenConnectionScreen = onOpenConnectionScreen
-                    )
-                    AppScreen.LOGS -> LogsScreen()
-                }
+        }
+    ) { paddingValues ->
+        Box(modifier = Modifier.padding(paddingValues).fillMaxSize()) {
+            when (currentScreen) {
+                AppScreen.CHAT -> ChatScreen(
+                    apiKey = apiKey,
+                    connectionManager = connectionManager,
+                    storage = storage,
+                    newThreadEvent = newThreadEvent,
+                    threads = threads,
+                    onThreadsChange = { threads = it },
+                    currentThreadId = currentThreadId,
+                    onCurrentThreadIdChange = { currentThreadId = it }
+                )
+                AppScreen.SETTINGS -> SettingsScreen(
+                    apiKey = apiKey,
+                    connectionString = connectionString,
+                    connectionState = connectionState,
+                    onConnectionStringChanged = onConnectionStringChanged,
+                    onOpenConnectionScreen = onOpenConnectionScreen,
+                    onApiKeyReceived = {
+                        onApiKeyReceived(it)
+                        attemptedRemoteApiKeyFetch = it.isNotBlank()
+                    }
+                )
+                AppScreen.LOGS -> LogsScreen()
             }
         }
     }
@@ -430,7 +479,8 @@ fun SettingsScreen(
     connectionString: String,
     connectionState: com.hermes.connection.WebSocketClient.ConnectionState,
     onConnectionStringChanged: (String) -> Unit,
-    onOpenConnectionScreen: () -> Unit
+    onOpenConnectionScreen: () -> Unit,
+    onApiKeyReceived: (String) -> Unit
 ) {
     // Parse addresses from connectionString
     var addresses by remember(connectionString) {
@@ -443,6 +493,7 @@ fun SettingsScreen(
             } else emptyList()
         )
     }
+    var keyInput by remember(apiKey) { mutableStateOf(apiKey) }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text("Settings", style = MaterialTheme.typography.h5)
@@ -481,7 +532,11 @@ fun SettingsScreen(
                 }
             }
             
-            Row(modifier = Modifier.weight(1f), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 TextButton(onClick = {
                     addresses = addresses + ""
                 }) {
@@ -516,6 +571,21 @@ fun SettingsScreen(
         Spacer(modifier = Modifier.height(16.dp))
         Text("API Key:", color = Color.Gray)
         Text(if (apiKey.isNotEmpty()) "Set (${apiKey.take(5)}...)" else "Not Set", modifier = Modifier.padding(vertical = 8.dp))
+        OutlinedTextField(
+            value = keyInput,
+            onValueChange = { keyInput = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Gemini API Key") },
+            visualTransformation = PasswordVisualTransformation(),
+            singleLine = true
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Button(
+            onClick = { onApiKeyReceived(keyInput) },
+            enabled = keyInput.isNotBlank()
+        ) {
+            Text(if (apiKey.isNotEmpty()) "Update API Key" else "Save API Key")
+        }
         Spacer(modifier = Modifier.height(16.dp))
         val statusText = when (connectionState) {
             com.hermes.connection.WebSocketClient.ConnectionState.Connected -> "Connected"
@@ -586,8 +656,9 @@ fun ChatScreen(
     
     // Toggle to use Mock LLM instead of Gemini based on ENV
     val useMockLlm = com.hermes.BuildEnv.ENV == "test" || com.hermes.BuildEnv.ENV == "dev"
+    val canUseAssistantFeatures = useMockLlm || apiKey.isNotBlank()
     
-    val geminiLlm = remember { GeminiTextInterface(apiKey, toolRegistry) }
+    val geminiLlm = remember(apiKey) { GeminiTextInterface(apiKey, toolRegistry) }
     val mockLlm = remember { MockLlmInterface(toolRegistry) }
     
     val isGenerating by if (useMockLlm) mockLlm.isGenerating.collectAsState() else geminiLlm.isGenerating.collectAsState()
@@ -599,7 +670,58 @@ fun ChatScreen(
     var replyToMessage by remember { mutableStateOf<ChatMessage?>(null) }
     var isVoiceActive by remember { mutableStateOf(false) }
     var voiceSession by remember { mutableStateOf<VoiceSession?>(null) }
+    var voiceCollectorJob by remember { mutableStateOf<Job?>(null) }
     val focusManager = LocalFocusManager.current
+
+    fun stopVoiceSession() {
+        voiceCollectorJob?.cancel()
+        voiceCollectorJob = null
+        voiceSession?.stop()
+        voiceSession = null
+        isVoiceActive = false
+    }
+
+    suspend fun ensureThreadExists(): String {
+        currentThreadId?.let { return it }
+
+        val localId = "local_${kotlin.random.Random.nextInt()}"
+        val newThread = ThreadInfo(localId, "New Thread")
+        onThreadsChange(threads + newThread)
+        onCurrentThreadIdChange(localId)
+
+        val reqId = "req_${kotlin.random.Random.nextInt()}"
+        val res = connectionManager.webSocketClient.sendAndWait(buildJsonObject {
+            put("event", "thread.create")
+            put("id", reqId)
+            put("ts", 0)
+            put("payload", buildJsonObject {})
+        })
+
+        val realId = res
+            ?.get("payload")
+            ?.jsonObject
+            ?.get("thread")
+            ?.jsonObject
+            ?.get("thread_id")
+            ?.jsonPrimitive
+            ?.contentOrNull
+
+        if (res != null && res["event"]?.jsonPrimitive?.content == "thread.create.result" && realId != null) {
+            onThreadsChange(threads.map { if (it.id == localId) it.copy(id = realId) else it })
+            if (currentThreadId == localId) {
+                onCurrentThreadIdChange(realId)
+            }
+            return realId
+        }
+
+        return localId
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            stopVoiceSession()
+        }
+    }
 
     // Save threads to local storage
     LaunchedEffect(threads) {
@@ -678,10 +800,11 @@ fun ChatScreen(
 
     // Load thread content when thread changes
     LaunchedEffect(currentThreadId) {
-        if (currentThreadId != null) {
-            storage.setString("last_thread_id", currentThreadId!!)
+        val selectedThreadId = currentThreadId
+        if (selectedThreadId != null) {
+            storage.setString("last_thread_id", selectedThreadId)
             
-            val localMsgsStr = storage.getString("thread_msgs_$currentThreadId")
+            val localMsgsStr = storage.getString("thread_msgs_$selectedThreadId")
             if (localMsgsStr != null) {
                 try {
                     val parsed = Json.parseToJsonElement(localMsgsStr).jsonArray
@@ -690,7 +813,9 @@ fun ChatScreen(
                         ChatMessage(
                             obj["role"]?.jsonPrimitive?.content ?: "user",
                             obj["content"]?.jsonPrimitive?.content ?: "",
-                            obj["isToolResult"]?.jsonPrimitive?.boolean ?: false
+                            obj["isToolResult"]?.jsonPrimitive?.boolean ?: false,
+                            obj["isVoiceTranscript"]?.jsonPrimitive?.boolean ?: false,
+                            obj["isVoicePartial"]?.jsonPrimitive?.boolean ?: false
                         )
                     }
                 } catch (e: Exception) {
@@ -721,6 +846,8 @@ fun ChatScreen(
                         put("role", msg.role)
                         put("content", msg.content)
                         put("isToolResult", msg.isToolResult)
+                        put("isVoiceTranscript", msg.isVoiceTranscript)
+                        put("isVoicePartial", msg.isVoicePartial)
                     })
                 }
             }
@@ -736,18 +863,30 @@ fun ChatScreen(
         ) {
             if (currentThreadId == null) {
                 item {
-                    Text("Type below to start a new thread.", color = Color.Gray, modifier = Modifier.fillMaxWidth())
+                    val emptyStateText = if (canUseAssistantFeatures) {
+                        "Type below to start a new thread."
+                    } else {
+                        "Add your Gemini API key in Settings to enable chat and voice."
+                    }
+                    Text(emptyStateText, color = Color.Gray, modifier = Modifier.fillMaxWidth())
                 }
             } else {
                 items(messages) { msg ->
                     Row(
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = if (msg.role == "user") Arrangement.End else Arrangement.Start
                     ) {
+                        val bubbleColor = when {
+                            msg.role == "user" && msg.isVoiceTranscript -> Color(0xFF1565C0)
+                            msg.role == "model" && msg.isVoiceTranscript -> Color(0xFF2E7D32)
+                            msg.role == "user" -> Color(0xFF0056B3)
+                            msg.isToolResult -> Color(0xFF444444)
+                            else -> Color(0xFF333333)
+                        }
                         Box(
                             modifier = Modifier
                                 .background(
-                                    color = if (msg.role == "user") Color(0xFF0056B3) else if (msg.isToolResult) Color(0xFF444444) else Color(0xFF333333),
+                                    color = bubbleColor,
                                     shape = MaterialTheme.shapes.medium
                                 )
                                 .clickable { replyToMessage = msg }
@@ -816,7 +955,7 @@ fun ChatScreen(
                     trailingIcon = {
                         IconButton(
                             onClick = {
-                                if (input.isNotBlank() && !isGenerating) {
+                                if (canUseAssistantFeatures && input.isNotBlank() && !isGenerating) {
                                     val text = if (replyToMessage != null) {
                                         val replyContext = replyToMessage!!.content.lines().joinToString("\n") { "> $it" }
                                         "Response to:\n$replyContext\n\n$input"
@@ -924,36 +1063,63 @@ fun ChatScreen(
                     }
                 )
                 IconButton(onClick = {
+                    if (!canUseAssistantFeatures) {
+                        showPlatformToast("Gemini API key is missing. Add it in Settings or connect to a server that provides one.")
+                        return@IconButton
+                    }
                     if (isVoiceActive) {
-                        voiceSession?.stop()
-                        voiceSession = null
-                        isVoiceActive = false
+                        stopVoiceSession()
                     } else {
-                        val toolsArray = buildJsonArray {
-                            toolRegistry.getDeclarations().forEach { decl ->
-                                add(buildJsonObject {
-                                    put("name", decl.name)
-                                    put("description", decl.description)
-                                    put("parameters", decl.parameters)
-                                })
-                            }
-                        }
-                        
-                        val threadContext = messages.joinToString("\n") { "${it.role}: ${it.content}" }
-                        val personaContext = "You are Hermes, a helpful assistant with access to a remote server. Use tools when necessary.\n\nCurrent thread context:\n$threadContext"
-                        
-                        val session = VoiceSession(
-                            apiKey = apiKey,
-                            systemInstruction = personaContext,
-                            tools = toolsArray,
-                            toolRegistry = toolRegistry
-                        )
-                        voiceSession = session
-                        isVoiceActive = true
                         coroutineScope.launch {
-                            session.start()
-                            session.transcripts.collect { text ->
-                                messages = messages + ChatMessage("model", text)
+                            ensureThreadExists()
+                            val toolsArray = buildJsonArray {
+                                toolRegistry.getDeclarations().forEach { decl ->
+                                    add(buildJsonObject {
+                                        put("name", decl.name)
+                                        put("description", decl.description)
+                                        put("parameters", decl.parameters)
+                                    })
+                                }
+                            }
+
+                            val threadContext = messages.joinToString("\n") { "${it.role}: ${it.content}" }
+                            val personaContext = "You are Hermes, a helpful assistant with access to a remote server. Use tools when necessary.\n\nCurrent thread context:\n$threadContext"
+
+                            val session = VoiceSession(
+                                apiKey = apiKey,
+                                systemInstruction = personaContext,
+                                tools = toolsArray,
+                                toolRegistry = toolRegistry,
+                                onError = { throwable ->
+                                    messages = messages + ChatMessage(
+                                        "model",
+                                        "Voice session error: ${throwable.message ?: "Unknown error"}",
+                                        isToolResult = true
+                                    )
+                                    stopVoiceSession()
+                                }
+                            )
+                            voiceSession = session
+                            isVoiceActive = true
+                            voiceCollectorJob = launch {
+                                session.transcripts.collect { transcript ->
+                                    messages = upsertVoiceTranscript(messages, transcript)
+                                }
+                            }
+
+                            try {
+                                session.start()
+                            } catch (e: Throwable) {
+                                messages = messages + ChatMessage(
+                                    "model",
+                                    "Voice session failed to start: ${e.message ?: "Unknown error"}",
+                                    isToolResult = true
+                                )
+                                if (voiceSession == session) {
+                                    stopVoiceSession()
+                                } else {
+                                    voiceCollectorJob?.cancel()
+                                }
                             }
                         }
                     }
@@ -961,7 +1127,11 @@ fun ChatScreen(
                     Icon(
                         if (isVoiceActive) Icons.Filled.Close else Icons.Filled.PlayArrow,
                         contentDescription = "Toggle Voice",
-                        tint = if (isVoiceActive) Color.Red else Color.White
+                        tint = when {
+                            !canUseAssistantFeatures -> Color.Gray
+                            isVoiceActive -> Color.Red
+                            else -> Color.White
+                        }
                     )
                 }
             }

@@ -10,3 +10,7 @@ class JsKeyValueStorage : KeyValueStorage {
 }
 
 actual fun getStorage(): KeyValueStorage = JsKeyValueStorage()
+
+actual fun showPlatformToast(message: String) {
+    console.log(message)
+}

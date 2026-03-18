@@ -1,33 +1,121 @@
 package com.hermes.voice
 
+import com.hermes.ui.EventLogger
 import io.ktor.client.*
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.websocket.*
-import io.ktor.http.*
 import io.ktor.websocket.*
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
-import kotlinx.serialization.json.*
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 
 class GeminiLiveClient(private val apiKey: String) {
     private val client = HttpClient {
-        install(WebSockets)
+        install(HttpTimeout) {
+            requestTimeoutMillis = HttpTimeout.INFINITE_TIMEOUT_MS
+            connectTimeoutMillis = 10_000L
+            socketTimeoutMillis = HttpTimeout.INFINITE_TIMEOUT_MS
+        }
+        install(WebSockets) {
+            pingInterval = 20_000L
+        }
     }
+
     private var session: DefaultClientWebSocketSession? = null
-    private val scope = CoroutineScope(Dispatchers.Default + Job())
-    
-    private val _incomingMessages = MutableSharedFlow<JsonObject>()
-    val incomingMessages: SharedFlow<JsonObject> = _incomingMessages.asSharedFlow()
+    private var receiveJob: Job? = null
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val json = Json { ignoreUnknownKeys = true }
+    private var setupComplete = CompletableDeferred<Unit>()
+
+    private val _incomingMessages = MutableSharedFlow<JsonObject>(extraBufferCapacity = 64)
+    val incomingMessages: SharedFlow<JsonObject> = _incomingMessages
 
     suspend fun connect(systemInstruction: String? = null, tools: JsonArray? = null) {
-        val url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=$apiKey"
+        val url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
+        EventLogger.log("Connecting Gemini Live session")
         session = client.webSocketSession(url)
-        
-        // Initial setup message
+        setupComplete = CompletableDeferred()
+
+        receiveJob?.cancel()
+        receiveJob = scope.launch {
+            try {
+                for (frame in session!!.incoming) {
+                    if (frame !is Frame.Text) {
+                        continue
+                    }
+                    val payload = frame.readText()
+                    val message = json.parseToJsonElement(payload).jsonObject
+                    when {
+                        message["setupComplete"] != null -> {
+                            EventLogger.log("Gemini Live session configured")
+                            if (!setupComplete.isCompleted) {
+                                setupComplete.complete(Unit)
+                            }
+                        }
+                        message["goAway"] != null -> {
+                            val reason = message["goAway"]?.jsonObject
+                                ?.get("reason")
+                                ?.jsonPrimitive
+                                ?.contentOrNull
+                                ?: "Server requested disconnect"
+                            EventLogger.log("Gemini Live goAway: $reason", isError = true)
+                        }
+                        message["toolCallCancellation"] != null -> {
+                            EventLogger.log("Gemini Live cancelled pending tool call")
+                        }
+                        else -> {
+                            EventLogger.log("Gemini Live message received")
+                        }
+                    }
+                    _incomingMessages.emit(message)
+                }
+            } catch (e: Exception) {
+                if (!setupComplete.isCompleted) {
+                    setupComplete.completeExceptionally(e)
+                }
+                EventLogger.log("Gemini Live receive failed: ${e.message ?: e}", isError = true)
+            }
+        }
+
         val setupMessage = buildJsonObject {
             put("setup", buildJsonObject {
-                put("model", "models/gemini-2.0-flash-exp")
+                put("model", "models/gemini-2.5-flash-native-audio-preview-12-2025")
+                put("generationConfig", buildJsonObject {
+                    put("responseModalities", buildJsonArray { add(JsonPrimitive("AUDIO")) })
+                })
+                put("speechConfig", buildJsonObject {
+                    put("voiceConfig", buildJsonObject {
+                        put("prebuiltVoiceConfig", buildJsonObject {
+                            put("voiceName", "Kore")
+                        })
+                    })
+                })
+                put("inputAudioTranscription", buildJsonObject {})
+                put("outputAudioTranscription", buildJsonObject {})
+                put("realtimeInputConfig", buildJsonObject {
+                    put("automaticActivityDetection", buildJsonObject {
+                        put("disabled", false)
+                    })
+                })
                 if (systemInstruction != null) {
                     put("systemInstruction", buildJsonObject {
                         put("parts", buildJsonArray {
@@ -35,68 +123,73 @@ class GeminiLiveClient(private val apiKey: String) {
                         })
                     })
                 }
-                if (tools != null) {
-                    put("tools", tools)
+                if (tools != null && tools.isNotEmpty()) {
+                    put("tools", buildJsonArray {
+                        add(buildJsonObject {
+                            put("functionDeclarations", tools)
+                        })
+                    })
                 }
             })
         }
-        
-        sendJson(setupMessage)
 
-        scope.launch {
-            try {
-                for (frame in session!!.incoming) {
-                    if (frame is Frame.Text) {
-                        val text = frame.readText()
-                        val json = Json.parseToJsonElement(text).jsonObject
-                        _incomingMessages.emit(json)
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+        sendJson(setupMessage)
+        withTimeout(10_000L) {
+            setupComplete.await()
         }
     }
 
     @OptIn(ExperimentalEncodingApi::class)
     suspend fun sendAudio(pcmData: ByteArray) {
         val base64Data = Base64.encode(pcmData)
-        val msg = buildJsonObject {
-            put("realtimeInput", buildJsonObject {
-                put("mediaChunks", buildJsonArray {
-                    add(buildJsonObject {
-                        put("mimeType", "audio/pcm;rate=16000")
+        sendJson(
+            buildJsonObject {
+                put("realtimeInput", buildJsonObject {
+                    put("audio", buildJsonObject {
                         put("data", base64Data)
+                        put("mimeType", "audio/pcm;rate=16000")
                     })
                 })
-            })
-        }
-        sendJson(msg)
+            }
+        )
     }
 
-    suspend fun sendToolResponse(callId: String, name: String, response: JsonObject) {
-        val msg = buildJsonObject {
-            put("toolResponse", buildJsonObject {
-                put("functionResponses", buildJsonArray {
-                    add(buildJsonObject {
-                        put("id", callId)
-                        put("name", name)
-                        put("response", response)
-                    })
+    suspend fun endAudioStream() {
+        sendJson(
+            buildJsonObject {
+                put("realtimeInput", buildJsonObject {
+                    put("audioStreamEnd", true)
                 })
-            })
-        }
-        sendJson(msg)
+            }
+        )
     }
 
-    private suspend fun sendJson(json: JsonObject) {
-        session?.send(Frame.Text(json.toString()))
+    suspend fun sendToolResponse(functionResponses: JsonArray) {
+        sendJson(
+            buildJsonObject {
+                put("toolResponse", buildJsonObject {
+                    put("functionResponses", functionResponses)
+                })
+            }
+        )
     }
 
-    fun disconnect() {
+    private suspend fun sendJson(jsonObject: JsonObject) {
+        session?.send(Frame.Text(jsonObject.toString()))
+    }
+
+    fun disconnect(sendAudioStreamEnd: Boolean = false) {
         scope.launch {
+            try {
+                if (sendAudioStreamEnd) {
+                    endAudioStream()
+                }
+            } catch (_: Exception) {
+            }
             session?.close()
             session = null
+            receiveJob?.cancel()
+            scope.cancel()
         }
     }
 }

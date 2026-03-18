@@ -1,10 +1,11 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 use local_ip_address::local_ip;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -68,55 +69,91 @@ fn init_logging() {
         .init();
 }
 
+fn candidate_config_paths() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(explicit_path) = std::env::var("HERMES_CONFIG") {
+        let explicit_path = explicit_path.trim();
+        if !explicit_path.is_empty() {
+            candidates.push(PathBuf::from(explicit_path));
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("config.toml"));
+        candidates.push(cwd.join("server").join("config.toml"));
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("config.toml"));
+            for ancestor in exe_dir.ancestors() {
+                candidates.push(ancestor.join("config.toml"));
+                candidates.push(ancestor.join("server").join("config.toml"));
+            }
+        }
+    }
+
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let manifest_dir = PathBuf::from(manifest_dir);
+        candidates.push(manifest_dir.join("config.toml"));
+        if let Some(parent) = manifest_dir.parent() {
+            candidates.push(parent.join("server").join("config.toml"));
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".config").join("hermes").join("config.toml"));
+        candidates.push(
+            home.join("dev")
+                .join("hermes")
+                .join("taskbot")
+                .join("server")
+                .join("config.toml"),
+        );
+    }
+
+    let mut seen = BTreeSet::new();
+    candidates.retain(|path| seen.insert(path.clone()));
+    candidates
+}
+
+fn resolve_config_path() -> PathBuf {
+    candidate_config_paths()
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| Path::new("config.toml").to_path_buf())
+}
+
+fn public_address_candidates(config: &Config) -> Vec<String> {
+    let mut addrs = Vec::new();
+    let port = config.listen_addr.split(':').next_back().unwrap_or("55566");
+
+    if let Some(domain) = &config.public_domain {
+        let domain = domain.trim();
+        if !domain.is_empty() {
+            if domain.contains(':') {
+                addrs.push(domain.to_string());
+            } else {
+                addrs.push(format!("{}:443", domain));
+            }
+        }
+    }
+
+    if let Ok(my_local_ip) = local_ip() {
+        addrs.push(format!("{}:{}", my_local_ip, port));
+    }
+
+    let mut seen = BTreeSet::new();
+    addrs.retain(|addr| seen.insert(addr.clone()));
+    addrs
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let mut config_path = PathBuf::from("config.toml");
-
-    // If not found in current directory, try the executable's directory or the project root
-    if !config_path.exists() {
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                // Check if we're in target/release or target/debug and look up
-                let mut current = exe_dir;
-                while let Some(parent) = current.parent() {
-                    let maybe_config = current.join("config.toml");
-                    if maybe_config.exists() {
-                        config_path = maybe_config;
-                        break;
-                    }
-                    if current.file_name().and_then(|n| n.to_str()) == Some("server") {
-                        let maybe_config = current.join("config.toml");
-                        if maybe_config.exists() {
-                            config_path = maybe_config;
-                        }
-                        break;
-                    }
-                    current = parent;
-                }
-            }
-        }
-    }
-
-    // Fallback to absolute path if running globally
-    if !config_path.exists() {
-        let server_dir = std::env::var("HOME")
-            .map(|h| format!("{}/dev/hermes/alpha-b/server/config.toml", h))
-            .unwrap_or_else(|_| "config.toml".to_string());
-        let maybe_config = PathBuf::from(server_dir);
-        if maybe_config.exists() {
-            config_path = maybe_config;
-        } else {
-            // Also check current directory explicitly
-            let cwd_config = std::env::current_dir()
-                .unwrap_or_default()
-                .join("config.toml");
-            if cwd_config.exists() {
-                config_path = cwd_config;
-            }
-        }
-    }
-
+    let config_path = resolve_config_path();
     let config = Config::load(&config_path)?;
 
     match &cli.command {
@@ -155,23 +192,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Pair => {
-            let my_local_ip = local_ip().unwrap();
             let pubkey = "mock_pubkey"; // Replace with actual pubkey logic
             let pubkey_base64 = STANDARD.encode(pubkey);
-
-            let mut addrs = Vec::new();
-            let port = config.listen_addr.split(':').next_back().unwrap_or("55566");
-            if let Some(domain) = &config.public_domain {
-                if !domain.is_empty() {
-                    if domain.contains(':') {
-                        addrs.push(domain.clone());
-                    } else {
-                        // Assume Nginx with SSL proxying to 8080
-                        addrs.push(format!("{}:443", domain));
-                    }
-                }
-            }
-            addrs.push(format!("{}:{}", my_local_ip, port));
+            let addrs = public_address_candidates(&config);
 
             let addrs_query = addrs
                 .iter()
