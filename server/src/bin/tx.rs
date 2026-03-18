@@ -7,7 +7,7 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tx::config::Config;
 
@@ -301,6 +301,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 now.format("%Y-%m-%d %H:%M:%S")
             );
             info!("============================================================");
+            info!("Using config file {}", config_path.display());
+
+            let resolved_api_key = config.resolved_google_api_key_with_source();
+            match &resolved_api_key {
+                Some((_, source)) => {
+                    info!("Gemini API key loaded from {}", source.description());
+                }
+                None => {
+                    warn!(
+                        "No Gemini API key configured. Checked GEMINI_API_KEY, GOOGLE_API_KEY, [keys].gemini_api_key, [keys].google_api_key, and legacy google_api_key."
+                    );
+                }
+            }
 
             let pkm = tx::pkm::Pkm::new(config.vault_path.clone(), PathBuf::from("hermes.db"))?;
             pkm.index_vault()?;
@@ -311,7 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.listen_addr.clone(),
                 config.token.clone(),
                 pkm_arc,
-                config.google_api_key.clone(),
+                resolved_api_key.map(|(key, _)| key),
             );
             ws_server.run().await?;
         }

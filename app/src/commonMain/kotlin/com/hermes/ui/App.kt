@@ -99,48 +99,75 @@ fun App() {
     var apiKey by remember { mutableStateOf(storage.getString("gemini_api_key") ?: "") }
     var useStandalone by remember { mutableStateOf(storage.getString("use_standalone") == "true") }
     var showConnectionPrompt by remember { mutableStateOf(connectionString.isEmpty() && !useStandalone) }
+    var showApiKeyPrompt by remember { mutableStateOf(useStandalone && apiKey.isBlank()) }
+    LaunchedEffect(connectionString, useStandalone) {
+        showConnectionPrompt = connectionString.isEmpty() && !useStandalone
+        if (showConnectionPrompt) {
+            showApiKeyPrompt = false
+        }
+    }
 
     MaterialTheme(colors = darkColors()) {
         Surface(modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.systemBars).imePadding()) {
-            if (showConnectionPrompt) {
-                ConnectionScreen(
-                    onConnect = { str ->
-                        connectionString = str
-                        storage.setString("connection_string", str)
-                        useStandalone = false
-                        storage.setString("use_standalone", "false")
-                        showConnectionPrompt = false
-                    },
-                    onStandalone = {
-                        useStandalone = true
-                        storage.setString("use_standalone", "true")
-                        showConnectionPrompt = false
-                    }
-                )
-            } else {
-                MainAppScreen(
-                    connectionString = connectionString,
-                    apiKey = apiKey,
-                    storage = storage,
-                    onApiKeyReceived = { newKey ->
-                        apiKey = newKey
-                        storage.setString("gemini_api_key", newKey)
-                    },
-                    onDisconnect = {
-                        connectionString = ""
-                        storage.setString("connection_string", "")
-                        useStandalone = false
-                        storage.setString("use_standalone", "false")
-                        showConnectionPrompt = true
-                    },
-                    onOpenConnectionScreen = {
-                        showConnectionPrompt = true
-                    },
-                    onConnectionStringChanged = { str ->
-                        connectionString = str
-                        storage.setString("connection_string", str)
-                    }
-                )
+            when {
+                showConnectionPrompt -> {
+                    ConnectionScreen(
+                        onConnect = { str ->
+                            connectionString = str
+                            storage.setString("connection_string", str)
+                            useStandalone = false
+                            storage.setString("use_standalone", "false")
+                            showConnectionPrompt = false
+                            showApiKeyPrompt = false
+                        },
+                        onStandalone = {
+                            useStandalone = true
+                            storage.setString("use_standalone", "true")
+                            showConnectionPrompt = false
+                            showApiKeyPrompt = apiKey.isBlank()
+                        }
+                    )
+                }
+                showApiKeyPrompt -> {
+                    ApiKeyScreen(
+                        onKeySubmit = { newKey ->
+                            apiKey = newKey
+                            storage.setString("gemini_api_key", newKey)
+                            showApiKeyPrompt = false
+                        },
+                        onSkip = {
+                            showApiKeyPrompt = false
+                        }
+                    )
+                }
+                else -> {
+                    MainAppScreen(
+                        connectionString = connectionString,
+                        apiKey = apiKey,
+                        storage = storage,
+                        onApiKeyReceived = { newKey ->
+                            apiKey = newKey
+                            storage.setString("gemini_api_key", newKey)
+                            if (newKey.isNotBlank()) {
+                                showApiKeyPrompt = false
+                            }
+                        },
+                        onDisconnect = {
+                            connectionString = ""
+                            storage.setString("connection_string", "")
+                            useStandalone = false
+                            storage.setString("use_standalone", "false")
+                            showConnectionPrompt = true
+                        },
+                        onOpenConnectionScreen = {
+                            showConnectionPrompt = true
+                        },
+                        onConnectionStringChanged = { str ->
+                            connectionString = str
+                            storage.setString("connection_string", str)
+                        }
+                    )
+                }
             }
         }
     }
@@ -185,7 +212,7 @@ fun ConnectionScreen(onConnect: (String) -> Unit, onStandalone: () -> Unit) {
 }
 
 @Composable
-fun ApiKeyScreen(onKeySubmit: (String) -> Unit) {
+fun ApiKeyScreen(onKeySubmit: (String) -> Unit, onSkip: () -> Unit) {
     var keyInput by remember { mutableStateOf("") }
 
     Column(
@@ -207,8 +234,14 @@ fun ApiKeyScreen(onKeySubmit: (String) -> Unit) {
         
         Spacer(modifier = Modifier.height(16.dp))
         
-        Button(onClick = { onKeySubmit(keyInput) }) {
+        Button(onClick = { onKeySubmit(keyInput) }, enabled = keyInput.isNotBlank()) {
             Text("Save & Continue")
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        TextButton(onClick = onSkip) {
+            Text("Skip for now", color = Color.Gray)
         }
     }
 }
@@ -301,14 +334,20 @@ fun MainAppScreen(
                 put("ts", 0)
                 put("payload", buildJsonObject {})
             })
-            
+
             val res = withTimeoutOrNull(5.seconds) {
                 connectionManager.webSocketClient.events.first { it["ref_id"]?.jsonPrimitive?.content == reqId }
             }
-            
+
+            if (res == null) {
+                showPlatformToast("Connected, but the server did not return config in time.")
+            }
+
             val fetchedKey = res?.get("payload")?.jsonObject?.get("google_api_key")?.jsonPrimitive?.contentOrNull
             if (!fetchedKey.isNullOrEmpty()) {
                 onApiKeyReceived(fetchedKey)
+            } else {
+                showPlatformToast("Connected, but no Gemini API key was provided by the server. Add one in Settings to enable Gemini features.")
             }
         }
     }
