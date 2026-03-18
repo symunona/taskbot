@@ -1,14 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-pub struct KeyConfig {
-    #[serde(default)]
-    pub gemini_api_key: Option<String>,
-    #[serde(default)]
-    pub google_api_key: Option<String>,
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -18,7 +11,7 @@ pub struct Config {
     #[serde(default)]
     pub google_api_key: Option<String>,
     #[serde(default)]
-    pub keys: KeyConfig,
+    pub keys: HashMap<String, String>,
     pub public_domain: Option<String>,
 }
 
@@ -50,7 +43,7 @@ impl Default for Config {
             vault_path: PathBuf::from("./vault"),
             token: uuid::Uuid::new_v4().to_string(),
             google_api_key: None,
-            keys: KeyConfig::default(),
+            keys: HashMap::new(),
             public_domain: None,
         }
     }
@@ -92,20 +85,20 @@ impl Config {
 
         let config_gemini = self
             .keys
-            .gemini_api_key
-            .clone()
+            .get("gemini_api_key")
+            .cloned()
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty() && value != "your-gemini-api-key");
         if let Some(value) = config_gemini {
             return Some((value, GeminiApiKeySource::ConfigKeysGeminiApiKey));
         }
 
         let config_google = self
             .keys
-            .google_api_key
-            .clone()
+            .get("google_api_key")
+            .cloned()
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty() && value != "your-google-api-key");
         if let Some(value) = config_google {
             return Some((value, GeminiApiKeySource::ConfigKeysGoogleApiKey));
         }
@@ -113,7 +106,7 @@ impl Config {
         self.google_api_key
             .clone()
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty() && value != "your-google-api-key")
             .map(|value| (value, GeminiApiKeySource::LegacyConfigGoogleApiKey))
     }
 

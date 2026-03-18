@@ -69,61 +69,76 @@ fn init_logging() {
         .init();
 }
 
-fn candidate_config_paths() -> Vec<PathBuf> {
+fn candidate_config_paths() -> Vec<(PathBuf, &'static str)> {
     let mut candidates = Vec::new();
 
     if let Ok(explicit_path) = std::env::var("HERMES_CONFIG") {
         let explicit_path = explicit_path.trim();
         if !explicit_path.is_empty() {
-            candidates.push(PathBuf::from(explicit_path));
+            candidates.push((PathBuf::from(explicit_path), "HERMES_CONFIG env var"));
         }
     }
 
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("config.toml"));
-        candidates.push(cwd.join("server").join("config.toml"));
+        candidates.push((cwd.join("config.toml"), "current working directory"));
+        candidates.push((cwd.join("server").join("config.toml"), "server/ directory in current working directory"));
     }
 
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("config.toml"));
+            candidates.push((exe_dir.join("config.toml"), "executable directory"));
             for ancestor in exe_dir.ancestors() {
-                candidates.push(ancestor.join("config.toml"));
-                candidates.push(ancestor.join("server").join("config.toml"));
+                candidates.push((ancestor.join("config.toml"), "ancestor of executable directory"));
+                candidates.push((ancestor.join("server").join("config.toml"), "server/ in ancestor of executable directory"));
             }
         }
     }
 
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
         let manifest_dir = PathBuf::from(manifest_dir);
-        candidates.push(manifest_dir.join("config.toml"));
+        candidates.push((manifest_dir.join("config.toml"), "cargo manifest directory"));
         if let Some(parent) = manifest_dir.parent() {
-            candidates.push(parent.join("server").join("config.toml"));
+            candidates.push((parent.join("server").join("config.toml"), "server/ in parent of cargo manifest directory"));
         }
     }
 
     if let Ok(home) = std::env::var("HOME") {
         let home = PathBuf::from(home);
-        candidates.push(home.join(".config").join("hermes").join("config.toml"));
-        candidates.push(
+        candidates.push((home.join(".config").join("taskbot").join("config.toml"), "user config directory"));
+        candidates.push((
             home.join("dev")
                 .join("hermes")
                 .join("taskbot")
                 .join("server")
                 .join("config.toml"),
-        );
+            "dev taskbot directory"
+        ));
     }
 
     let mut seen = BTreeSet::new();
-    candidates.retain(|path| seen.insert(path.clone()));
+    candidates.retain(|(path, _)| seen.insert(path.clone()));
     candidates
 }
 
-fn resolve_config_path() -> PathBuf {
-    candidate_config_paths()
+fn resolve_config_path() -> (PathBuf, &'static str) {
+    let candidates = candidate_config_paths();
+    
+    // Sort to prefer local configs in debug mode, and ~/.config/taskbot in release mode (or service)
+    let is_release = !cfg!(debug_assertions);
+    if is_release {
+        // In release mode, prefer ~/.config/taskbot/config.toml
+        if let Ok(home) = std::env::var("HOME") {
+            let default_path = PathBuf::from(home).join(".config").join("taskbot").join("config.toml");
+            if default_path.exists() {
+                return (default_path, "user config directory (default for release/service)");
+            }
+        }
+    }
+
+    candidates
         .into_iter()
-        .find(|path| path.exists())
-        .unwrap_or_else(|| Path::new("config.toml").to_path_buf())
+        .find(|(path, _)| path.exists())
+        .unwrap_or_else(|| (Path::new("config.toml").to_path_buf(), "fallback default path"))
 }
 
 fn public_address_candidates(config: &Config) -> Vec<String> {
@@ -153,7 +168,7 @@ fn public_address_candidates(config: &Config) -> Vec<String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let config_path = resolve_config_path();
+    let (config_path, config_source) = resolve_config_path();
     let config = Config::load(&config_path)?;
 
     match &cli.command {
@@ -212,6 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Status => {
             println!("Hermes TX Service Health Condition:");
             println!("----------------------------------");
+            println!("- Config file: {} (resolved via: {})", config_path.display(), config_source);
 
             // Check if listening
             println!("- Service should be listening on {}", config.listen_addr);
@@ -301,7 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 now.format("%Y-%m-%d %H:%M:%S")
             );
             info!("============================================================");
-            info!("Using config file {}", config_path.display());
+            info!("Using config file {} (resolved via: {})", config_path.display(), config_source);
 
             let resolved_api_key = config.resolved_google_api_key_with_source();
             match &resolved_api_key {
@@ -315,6 +331,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            if !config.keys.is_empty() {
+                let mut key_names: Vec<&String> = config.keys.keys().collect();
+                key_names.sort();
+                let names_str = key_names
+                    .into_iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                info!("Available keys loaded: {}", names_str);
+            } else {
+                info!("Available keys loaded: None");
+            }
+
             let pkm = tx::pkm::Pkm::new(config.vault_path.clone(), PathBuf::from("hermes.db"))?;
             pkm.index_vault()?;
             pkm.watcher.watch()?;
@@ -325,6 +354,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.token.clone(),
                 pkm_arc,
                 resolved_api_key.map(|(key, _)| key),
+                config.keys.clone(),
             );
             ws_server.run().await?;
         }

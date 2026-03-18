@@ -152,13 +152,6 @@ fun App() {
                                 showApiKeyPrompt = false
                             }
                         },
-                        onDisconnect = {
-                            connectionString = ""
-                            storage.setString("connection_string", "")
-                            useStandalone = false
-                            storage.setString("use_standalone", "false")
-                            showConnectionPrompt = true
-                        },
                         onOpenConnectionScreen = {
                             showConnectionPrompt = true
                         },
@@ -252,13 +245,11 @@ fun MainAppScreen(
     apiKey: String,
     storage: KeyValueStorage,
     onApiKeyReceived: (String) -> Unit,
-    onDisconnect: () -> Unit,
     onOpenConnectionScreen: () -> Unit,
     onConnectionStringChanged: (String) -> Unit
 ) {
     val connectionManager = remember { ConnectionManager() }
     val connectionState by connectionManager.webSocketClient.connectionState.collectAsState()
-    var attemptedRemoteApiKeyFetch by remember { mutableStateOf(apiKey.isNotEmpty()) }
 
     val scaffoldState = rememberScaffoldState()
     val coroutineScope = rememberCoroutineScope()
@@ -305,28 +296,18 @@ fun MainAppScreen(
         }
     }
 
-    LaunchedEffect(apiKey) {
-        if (apiKey.isNotBlank()) {
-            attemptedRemoteApiKeyFetch = true
-        }
-    }
+    var isConnectionActive by remember { mutableStateOf(true) }
 
-    LaunchedEffect(connectionString) {
-        attemptedRemoteApiKeyFetch = apiKey.isNotBlank()
-        if (connectionString.isNotEmpty()) {
+    LaunchedEffect(connectionString, isConnectionActive) {
+        if (connectionString.isNotEmpty() && isConnectionActive) {
             connectionManager.connectFromString(connectionString)
         } else {
             connectionManager.webSocketClient.disconnect()
         }
     }
     
-    LaunchedEffect(connectionState, apiKey, attemptedRemoteApiKeyFetch) {
-        if (
-            connectionState == com.hermes.connection.WebSocketClient.ConnectionState.Connected &&
-            apiKey.isEmpty() &&
-            !attemptedRemoteApiKeyFetch
-        ) {
-            attemptedRemoteApiKeyFetch = true
+    LaunchedEffect(connectionState) {
+        if (connectionState == com.hermes.connection.WebSocketClient.ConnectionState.Connected) {
             val reqId = "req_${kotlin.random.Random.nextInt()}"
             connectionManager.webSocketClient.send(buildJsonObject {
                 put("event", "system.config.get")
@@ -341,13 +322,18 @@ fun MainAppScreen(
 
             if (res == null) {
                 showPlatformToast("Connected, but the server did not return config in time.")
-            }
-
-            val fetchedKey = res?.get("payload")?.jsonObject?.get("google_api_key")?.jsonPrimitive?.contentOrNull
-            if (!fetchedKey.isNullOrEmpty()) {
-                onApiKeyReceived(fetchedKey)
             } else {
-                showPlatformToast("Connected, but no Gemini API key was provided by the server. Add one in Settings to enable Gemini features.")
+                val payload = res.get("payload")?.jsonObject
+                val keysObj = payload?.get("keys")?.jsonObject
+                keysObj?.forEach { (k, v) ->
+                    storage.setString("key_$k", v.jsonPrimitive.content)
+                }
+                val fetchedKey = payload?.get("google_api_key")?.jsonPrimitive?.contentOrNull
+                if (!fetchedKey.isNullOrEmpty()) {
+                    onApiKeyReceived(fetchedKey)
+                } else if (apiKey.isEmpty()) {
+                    showPlatformToast("Connected, but no Gemini API key was provided by the server. Add one in Settings to enable Gemini features.")
+                }
             }
         }
     }
@@ -461,13 +447,13 @@ fun MainAppScreen(
                 if (connectionString.isNotEmpty()) {
                     Button(
                         onClick = {
-                            onDisconnect()
+                            isConnectionActive = !isConnectionActive
                             coroutineScope.launch { scaffoldState.drawerState.close() }
                         },
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(backgroundColor = Color.DarkGray)
                     ) {
-                        Text("Disconnect", color = Color.White)
+                        Text(if (isConnectionActive) "Disconnect" else "Connect", color = Color.White)
                     }
                 } else {
                     Button(
@@ -503,7 +489,6 @@ fun MainAppScreen(
                     onOpenConnectionScreen = onOpenConnectionScreen,
                     onApiKeyReceived = {
                         onApiKeyReceived(it)
-                        attemptedRemoteApiKeyFetch = it.isNotBlank()
                     }
                 )
                 AppScreen.LOGS -> LogsScreen()
@@ -603,8 +588,15 @@ fun SettingsScreen(
         }
         
         Spacer(modifier = Modifier.height(16.dp))
-        Button(onClick = onOpenConnectionScreen) {
-            Text("Pair New Device")
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onOpenConnectionScreen, modifier = Modifier.weight(1f)) {
+                Text("Pair New Device")
+            }
+            if (connectionString.isNotEmpty()) {
+                OutlinedButton(onClick = { onConnectionStringChanged("") }, modifier = Modifier.weight(1f)) {
+                    Text("Unpair", color = Color.Red)
+                }
+            }
         }
         
         Spacer(modifier = Modifier.height(16.dp))

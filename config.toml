@@ -1,3 +1,0 @@
-listen_addr = "0.0.0.0:8080"
-vault_path = "./vault"
-token = "a44588ea-ce4b-411b-8c26-43cd64d2087b"

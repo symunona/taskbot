@@ -23,15 +23,17 @@ pub struct WsServer {
     token: String,
     pkm: Arc<Pkm>,
     google_api_key: Option<String>,
+    keys: std::collections::HashMap<String, String>,
 }
 
 impl WsServer {
-    pub fn new(addr: String, token: String, pkm: Arc<Pkm>, google_api_key: Option<String>) -> Self {
+    pub fn new(addr: String, token: String, pkm: Arc<Pkm>, google_api_key: Option<String>, keys: std::collections::HashMap<String, String>) -> Self {
         Self {
             addr,
             token,
             pkm,
             google_api_key,
+            keys,
         }
     }
 
@@ -43,6 +45,7 @@ impl WsServer {
             let token = self.token.clone();
             let pkm = self.pkm.clone();
             let api_key = self.google_api_key.clone();
+            let keys = self.keys.clone();
 
             tokio::spawn(async move {
                 match accept_async(stream).await {
@@ -106,7 +109,7 @@ impl WsServer {
                                                 info!(
                                                     "Client requested system config (API Key exchange)"
                                                 );
-                                                Self::handle_system_config_get(envelope, &api_key)
+                                                Self::handle_system_config_get(envelope, &api_key, &keys)
                                             }
                                             "thread.list" => {
                                                 Self::handle_thread_list(envelope, &pkm)
@@ -219,11 +222,14 @@ impl WsServer {
         )
     }
 
-    fn handle_system_config_get(req: EventEnvelope, api_key: &Option<String>) -> EventEnvelope {
+    fn handle_system_config_get(req: EventEnvelope, api_key: &Option<String>, keys: &std::collections::HashMap<String, String>) -> EventEnvelope {
         Self::create_response(
             req.id,
             "system.config.result",
-            serde_json::json!({"google_api_key": api_key}),
+            serde_json::json!({
+                "google_api_key": api_key,
+                "keys": keys
+            }),
         )
     }
 
