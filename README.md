@@ -14,8 +14,9 @@ Backend: Rust `tx-service` (daemon), `tx` (CLI tool)
 ### 1. Prerequisites 📦
 - use SDKMAN! to manage Java versions
     - JDK 17+
-    - Android SDK
+    - Android SDK (including platform-tools / `adb` for `just deploy`)
 - Rust toolchain and Cargo
+- `just`
 - Backend: Linux with `systemd --user` support
 
 ### 2. Clone the repository 📥
@@ -24,23 +25,29 @@ git clone <your-repo-url>
 cd taskbot
 ```
 
-### 3. Install the backend service 🦀
+### 3. Install or update the backend service 🦀
 ```bash
-chmod +x install.sh
-./install.sh
+just install
 ```
-This script builds `tx`, uses `server/config.toml` as the active config, migrates `config.toml` from the repo root if needed, runs `network-setup`, installs `tx` to `~/.local/bin/tx`, and enables `hermes-tx.service`.
+This wraps `install.sh`, which builds `tx`, uses `server/config.toml` as the active config, migrates `config.toml` from the repo root if needed, runs `network-setup`, installs `tx` to `~/.local/bin/tx`, and enables `hermes-tx.service`.
 
 ### 4. Build the Android debug APK 🤖
 ```bash
-chmod +x build_apk.sh
-./build_apk.sh
+just android-build
 ```
 The APK will be created at `androidApp/build/outputs/apk/debug/androidApp-debug.apk`.
 
+### 5. Deploy the APK to a connected device 📲
+```bash
+just deploy
+```
+This rebuilds the debug APK if needed and installs it on the connected device with `adb install -r`.
+
 ## Useful Commands 🧰
-- Backend debug build: `cd server && cargo build`
-- Backend release build: `cd server && cargo build --release`
-- Backend lint: `cd server && cargo clippy`
-- Backend format: `cd server && cargo fmt`
-- Android debug assemble: `ENV=prod ./gradlew :androidApp:assembleDebug`
+- List all grouped commands: `just --list --unsorted`
+- Build everything: `just build`
+- Install/update the backend service: `just install`
+- Build the Android debug APK: `just android-build`
+- Deploy the Android debug APK: `just deploy`
+- Server debug build: `just server-build`
+- Server lint: `just server-lint`
