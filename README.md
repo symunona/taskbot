@@ -1,18 +1,22 @@
-# Hermes 🛰️
+# Taskbot (codename project Hermes) 🛰️
 
-Hermes is a Kotlin Multiplatform + Rust project for secure message and task exchange across Android and web clients.
-It ships with a Rust backend service (`tx`) and a shared Compose UI module used by Android and JS targets.
-The `:app` module contains shared logic and UI, while `:androidApp` packages the Android application.
-A helper installer builds the backend, sets up networking, and installs a user-level systemd service.
-This repository also includes a shortcut script for producing a debug Android APK.
+Taskbot is an interactive voice agent that:
+- uses and syncs context specific memory
+- builds it's own knowledge base over time, and lets you configure EVERYTHING about it interactively
+- creates a bridge to your home computer or VPS via a secure WebSocket connection
+- lets you work on different contexts simultaneously
+
+Frontend: Kotlin Multiplatform (For now, Android App `TaskBot`)
+Backend: Rust `tx-service` (daemon), `tx` (CLI tool)
 
 ## Installation ⚙️
 
 ### 1. Prerequisites 📦
-- JDK 17+
-- Android SDK
+- use SDKMAN! to manage Java versions
+    - JDK 17+
+    - Android SDK
 - Rust toolchain and Cargo
-- Linux with `systemd --user` support
+- Backend: Linux with `systemd --user` support
 
 ### 2. Clone the repository 📥
 ```bash
