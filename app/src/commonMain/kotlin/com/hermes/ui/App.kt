@@ -19,9 +19,12 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.PlayArrow
 import com.hermes.connection.*
 import com.hermes.llm.*
 import com.hermes.tools.*
+import com.hermes.voice.VoiceSession
+import com.hermes.voice.VoiceManager
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
@@ -304,7 +307,7 @@ fun MainAppScreen(
                     
                     Spacer(modifier = Modifier.height(24.dp))
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.weight(1f),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -376,7 +379,7 @@ fun MainAppScreen(
                                 onDisconnect()
                                 coroutineScope.launch { scaffoldState.drawerState.close() }
                             },
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier.weight(1f),
                             colors = ButtonDefaults.buttonColors(backgroundColor = Color.DarkGray)
                         ) {
                             Text("Disconnect", color = Color.White)
@@ -478,7 +481,7 @@ fun SettingsScreen(
                 }
             }
             
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Row(modifier = Modifier.weight(1f), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = {
                     addresses = addresses + ""
                 }) {
@@ -594,6 +597,8 @@ fun ChatScreen(
     var messages by remember { mutableStateOf(listOf<ChatMessage>()) }
     var input by remember { mutableStateOf("") }
     var replyToMessage by remember { mutableStateOf<ChatMessage?>(null) }
+    var isVoiceActive by remember { mutableStateOf(false) }
+    var voiceSession by remember { mutableStateOf<VoiceSession?>(null) }
     val focusManager = LocalFocusManager.current
 
     // Save threads to local storage
@@ -736,7 +741,7 @@ fun ChatScreen(
             } else {
                 items(messages) { msg ->
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.weight(1f),
                         horizontalArrangement = if (msg.role == "user") Arrangement.End else Arrangement.Start
                     ) {
                         Box(
@@ -803,7 +808,7 @@ fun ChatScreen(
                 OutlinedTextField(
                     value = input,
                     onValueChange = { input = it },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.weight(1f),
                     colors = TextFieldDefaults.outlinedTextFieldColors(
                         backgroundColor = Color(0xFF1E1E1E),
                         textColor = Color.White
@@ -915,10 +920,51 @@ fun ChatScreen(
                     }
                 }) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", tint = if (isGenerating || input.isBlank()) Color.Gray else Color.White)
+                        }
+                    }
+                )
+                IconButton(onClick = {
+                    if (isVoiceActive) {
+                        voiceSession?.stop()
+                        voiceSession = null
+                        isVoiceActive = false
+                    } else {
+                        val toolsArray = buildJsonArray {
+                            toolRegistry.getDeclarations().forEach { decl ->
+                                add(buildJsonObject {
+                                    put("name", decl.name)
+                                    put("description", decl.description)
+                                    put("parameters", decl.parameters)
+                                })
+                            }
+                        }
+                        
+                        val threadContext = messages.joinToString("\n") { "${it.role}: ${it.content}" }
+                        val personaContext = "You are Hermes, a helpful assistant with access to a remote server. Use tools when necessary.\n\nCurrent thread context:\n$threadContext"
+                        
+                        val session = VoiceSession(
+                            apiKey = apiKey,
+                            systemInstruction = personaContext,
+                            tools = toolsArray,
+                            toolRegistry = toolRegistry
+                        )
+                        voiceSession = session
+                        isVoiceActive = true
+                        coroutineScope.launch {
+                            session.start()
+                            session.transcripts.collect { text ->
+                                messages = messages + ChatMessage("model", text)
+                            }
+                        }
+                    }
+                }) {
+                    Icon(
+                        if (isVoiceActive) Icons.Filled.Close else Icons.Filled.PlayArrow,
+                        contentDescription = "Toggle Voice",
+                        tint = if (isVoiceActive) Color.Red else Color.White
+                    )
                 }
             }
-        )
         }
     }
-}
 }
