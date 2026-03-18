@@ -335,8 +335,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("No authorized clients found.");
                     } else {
                         println!(
-                            "{:<36} | {:<20} | {:<20} | {}",
-                            "Client ID", "Paired At", "Last Seen", "Label"
+                            "{:<36} | {:<20} | {:<20} | Label",
+                            "Client ID", "Paired At", "Last Seen"
                         );
                         println!("{:-<36}-+-{:-<20}-+-{:-<20}-+-{:-<20}", "", "", "", "");
                         for c in clients {
