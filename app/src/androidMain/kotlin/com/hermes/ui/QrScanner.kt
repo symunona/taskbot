@@ -20,6 +20,7 @@ actual fun QrScannerButton(onScanned: (String) -> Unit) {
         options.setDesiredBarcodeFormats(ScanOptions.QR_CODE)
         options.setPrompt("Scan Hermes Connection QR Code")
         options.setBeepEnabled(false)
+        options.setOrientationLocked(false)
         launcher.launch(options)
     }) {
         Text("Scan QR Code")

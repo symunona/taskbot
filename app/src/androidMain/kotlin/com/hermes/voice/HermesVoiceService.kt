@@ -10,6 +10,8 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 
+import android.app.PendingIntent
+
 class HermesVoiceService : Service() {
     companion object {
         private const val CHANNEL_ID = "hermes_voice_channel"
@@ -32,10 +34,19 @@ class HermesVoiceService : Service() {
             return START_NOT_STICKY
         }
 
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            launchIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Hermes Voice Active")
             .setContentText("Listening and processing...")
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(pendingIntent)
             .setOngoing(true)
             .build()
 

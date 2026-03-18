@@ -1,5 +1,6 @@
 package com.hermes.ui
 
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -13,6 +14,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -91,6 +94,48 @@ private fun upsertVoiceTranscript(messages: List<ChatMessage>, transcript: Voice
         isVoiceTranscript = true,
         isVoicePartial = transcript.isPartial
     )
+}
+
+@Composable
+fun TypingIndicator() {
+    val infiniteTransition = rememberInfiniteTransition()
+    
+    val alpha1 by infiniteTransition.animateFloat(
+        initialValue = 0.2f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 600, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        )
+    )
+    
+    val alpha2 by infiniteTransition.animateFloat(
+        initialValue = 0.2f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 600, delayMillis = 200, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        )
+    )
+    
+    val alpha3 by infiniteTransition.animateFloat(
+        initialValue = 0.2f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 600, delayMillis = 400, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        )
+    )
+
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(4.dp)
+    ) {
+        Box(modifier = Modifier.size(8.dp).alpha(alpha1).background(Color.White, CircleShape))
+        Box(modifier = Modifier.size(8.dp).alpha(alpha2).background(Color.White, CircleShape))
+        Box(modifier = Modifier.size(8.dp).alpha(alpha3).background(Color.White, CircleShape))
+    }
 }
 
 @Composable
@@ -701,6 +746,7 @@ fun ChatScreen(
     var input by remember { mutableStateOf("") }
     var replyToMessage by remember { mutableStateOf<ChatMessage?>(null) }
     var isVoiceActive by remember { mutableStateOf(false) }
+    var isVoiceConnecting by remember { mutableStateOf(false) }
     var voiceSession by remember { mutableStateOf<VoiceSession?>(null) }
     var voiceCollectorJob by remember { mutableStateOf<Job?>(null) }
     val focusManager = LocalFocusManager.current
@@ -944,9 +990,23 @@ fun ChatScreen(
                         }
                     }
                 }
-                if (isGenerating) {
+                if (isGenerating && (messages.isEmpty() || messages.last().role != "model" || messages.last().content.isEmpty())) {
                     item {
-                        Text("Gemini is thinking...", color = Color.Gray)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.Start
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .background(
+                                        color = Color(0xFF333333),
+                                        shape = MaterialTheme.shapes.medium
+                                    )
+                                    .padding(10.dp)
+                            ) {
+                                TypingIndicator()
+                            }
+                        }
                     }
                 }
             }
@@ -1154,9 +1214,12 @@ fun ChatScreen(
                                 }
                             }
 
+                            isVoiceConnecting = true
                             try {
                                 session.start()
+                                isVoiceConnecting = false
                             } catch (e: Throwable) {
+                                isVoiceConnecting = false
                                 val errorDetail = e.message ?: "Unknown error"
                                 EventLogger.log("VoiceSession: failed to start: $errorDetail", isError = true)
                                 val userMessage = when {
@@ -1180,15 +1243,23 @@ fun ChatScreen(
                         }
                     }
                 }) {
-                    Icon(
-                        if (isVoiceActive) Icons.Filled.Close else Icons.Filled.PlayArrow,
-                        contentDescription = "Toggle Voice",
-                        tint = when {
-                            !canUseAssistantFeatures -> Color.Gray
-                            isVoiceActive -> Color.Red
-                            else -> Color.White
-                        }
-                    )
+                    if (isVoiceConnecting) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(24.dp),
+                            color = Color.White,
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Icon(
+                            if (isVoiceActive) Icons.Filled.Close else Icons.Filled.PlayArrow,
+                            contentDescription = "Toggle Voice",
+                            tint = when {
+                                !canUseAssistantFeatures -> Color.Gray
+                                isVoiceActive -> Color.Red
+                                else -> Color.White
+                            }
+                        )
+                    }
                 }
             }
         }

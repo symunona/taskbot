@@ -198,7 +198,51 @@ impl WsServer {
             .map(|c| c.brand())
             .unwrap_or("unknown")
             .to_string();
-        let uptime = System::uptime();
+            
+        let uptime_secs = System::uptime();
+        let days = uptime_secs / 86400;
+        let hours = (uptime_secs % 86400) / 3600;
+        let minutes = (uptime_secs % 3600) / 60;
+        let uptime_str = if days > 0 {
+            format!("{}d {}h {}m", days, hours, minutes)
+        } else if hours > 0 {
+            format!("{}h {}m", hours, minutes)
+        } else {
+            format!("{}m", minutes)
+        };
+
+        fn format_bytes(bytes: u64) -> String {
+            let gb = bytes as f64 / 1_073_741_824.0;
+            if gb >= 1.0 {
+                format!("{:.2} GB", gb)
+            } else {
+                let mb = bytes as f64 / 1_048_576.0;
+                format!("{:.2} MB", mb)
+            }
+        }
+
+        let ram_total = format_bytes(sys.total_memory());
+        let ram_used = format_bytes(sys.used_memory());
+        let ram_available = format_bytes(sys.available_memory());
+
+        let mut gpu_info = serde_json::Value::Null;
+        if let Ok(output) = std::process::Command::new("nvidia-smi")
+            .arg("--query-gpu=memory.used,memory.total")
+            .arg("--format=csv,noheader,nounits")
+            .output()
+        {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                if let Some(line) = stdout.lines().next() {
+                    let parts: Vec<&str> = line.split(',').collect();
+                    if parts.len() == 2 {
+                        gpu_info = serde_json::json!({
+                            "used": format!("{} MB", parts[0].trim()),
+                            "total": format!("{} MB", parts[1].trim())
+                        });
+                    }
+                }
+            }
+        }
 
         let vault_file_count = pkm
             .db
@@ -217,7 +261,11 @@ impl WsServer {
                 "hostname": hostname,
                 "cpu_info": cpu_info,
                 "vault_file_count": vault_file_count,
-                "uptime": uptime
+                "uptime": uptime_str,
+                "ram_total": ram_total,
+                "ram_used": ram_used,
+                "ram_available": ram_available,
+                "gpu": gpu_info
             }),
         )
     }
