@@ -4,7 +4,7 @@ This document provides instructions for AI agents operating in this codebase.
 
 ## General Guidelines
 
-- **Always ask for permission before executing a plan!** The planning and the implementing phase should be human gated!
+- **Ask for permission before executing a plan, except if it's explicitly written in the prompt to skip it.** The planning and the implementing phase should be human gated by default, but the human can owerwrite it!
 
 ## Rust Backend (`server/`)
 
@@ -22,6 +22,8 @@ The default command and build runner for the Rust backend is **Cargo** (`cargo`)
 
 - **After each task, run the linter and fix issues before a fresh commit.**
 - Do not ignore linter warnings; fix them using `cargo clippy --fix` or manually apply the suggested changes before finishing the task.
+- Before calling a feature DONE, always do a local build to make sure it worked.
+
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:full hash:d4f96305 -->
 ## Issue Tracking with bd (beads)
