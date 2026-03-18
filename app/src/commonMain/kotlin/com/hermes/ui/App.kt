@@ -142,6 +142,7 @@ fun TypingIndicator() {
 fun App() {
     val storage = remember { getStorage() }
     var connectionString by remember { mutableStateOf(storage.getString("connection_string") ?: "") }
+    var clientToken by remember { mutableStateOf(storage.getString("client_token") ?: "") }
     var apiKey by remember { mutableStateOf(storage.getString("gemini_api_key") ?: "") }
     var useStandalone by remember { mutableStateOf(storage.getString("use_standalone") == "true") }
     var showConnectionPrompt by remember { mutableStateOf(connectionString.isEmpty() && !useStandalone) }
@@ -159,8 +160,28 @@ fun App() {
                 showConnectionPrompt -> {
                     ConnectionScreen(
                         onConnect = { str ->
+                            if (str.startsWith("hermes://")) {
+                                val parts = str.substring(9).split("?")
+                                if (parts.size == 2) {
+                                    val queryParts = parts[1].split("&")
+                                    val expStr = queryParts.find { it.startsWith("exp=") }?.substring(4)
+                                    if (expStr != null) {
+                                        val exp = expStr.toLongOrNull()
+                                        if (exp != null) {
+                                            val now = kotlinx.datetime.Clock.System.now().epochSeconds
+                                            if (now > exp) {
+                                                showPlatformToast("This QR code has expired. Please generate a new one on the server.")
+                                                return@ConnectionScreen
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
                             connectionString = str
+                            clientToken = "" // Reset client token when scanning a new QR code
                             storage.setString("connection_string", str)
+                            storage.setString("client_token", "")
                             useStandalone = false
                             storage.setString("use_standalone", "false")
                             showConnectionPrompt = false
@@ -189,6 +210,7 @@ fun App() {
                 else -> {
                     MainAppScreen(
                         connectionString = connectionString,
+                        clientToken = clientToken,
                         apiKey = apiKey,
                         storage = storage,
                         onApiKeyReceived = { newKey ->
@@ -204,6 +226,10 @@ fun App() {
                         onConnectionStringChanged = { str ->
                             connectionString = str
                             storage.setString("connection_string", str)
+                        },
+                        onClientTokenReceived = { token ->
+                            clientToken = token
+                            storage.setString("client_token", token)
                         }
                     )
                 }
@@ -288,14 +314,20 @@ fun ApiKeyScreen(onKeySubmit: (String) -> Unit, onSkip: () -> Unit) {
 @Composable
 fun MainAppScreen(
     connectionString: String,
+    clientToken: String,
     apiKey: String,
     storage: KeyValueStorage,
     onApiKeyReceived: (String) -> Unit,
     onOpenConnectionScreen: () -> Unit,
-    onConnectionStringChanged: (String) -> Unit
+    onConnectionStringChanged: (String) -> Unit,
+    onClientTokenReceived: (String) -> Unit
 ) {
     val connectionManager = remember { ConnectionManager() }
     val connectionState by connectionManager.webSocketClient.connectionState.collectAsState()
+    
+    LaunchedEffect(Unit) {
+        connectionManager.webSocketClient.onClientTokenReceived = onClientTokenReceived
+    }
 
     val scaffoldState = rememberScaffoldState()
     val coroutineScope = rememberCoroutineScope()
@@ -344,9 +376,9 @@ fun MainAppScreen(
 
     var isConnectionActive by remember { mutableStateOf(true) }
 
-    LaunchedEffect(connectionString, isConnectionActive) {
+    LaunchedEffect(connectionString, clientToken, isConnectionActive) {
         if (connectionString.isNotEmpty() && isConnectionActive) {
-            connectionManager.connectFromString(connectionString)
+            connectionManager.connectFromString(connectionString, clientToken)
         } else {
             connectionManager.webSocketClient.disconnect()
         }

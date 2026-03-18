@@ -1,10 +1,12 @@
 use crate::pkm::Pkm;
+use crate::pairing_store::PairingStore;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio_tungstenite::accept_async;
 use tracing::{info, warn};
 
@@ -21,17 +23,29 @@ pub struct EventEnvelope {
 pub struct WsServer {
     addr: String,
     token: String,
+    legacy_auth: bool,
     pkm: Arc<Pkm>,
+    pairing_store: Arc<Mutex<PairingStore>>,
     google_api_key: Option<String>,
     keys: std::collections::HashMap<String, String>,
 }
 
 impl WsServer {
-    pub fn new(addr: String, token: String, pkm: Arc<Pkm>, google_api_key: Option<String>, keys: std::collections::HashMap<String, String>) -> Self {
+    pub fn new(
+        addr: String,
+        token: String,
+        legacy_auth: bool,
+        pkm: Arc<Pkm>,
+        pairing_store: Arc<Mutex<PairingStore>>,
+        google_api_key: Option<String>,
+        keys: std::collections::HashMap<String, String>
+    ) -> Self {
         Self {
             addr,
             token,
+            legacy_auth,
             pkm,
+            pairing_store,
             google_api_key,
             keys,
         }
@@ -43,7 +57,9 @@ impl WsServer {
 
         while let Ok((stream, addr)) = listener.accept().await {
             let token = self.token.clone();
+            let legacy_auth = self.legacy_auth;
             let pkm = self.pkm.clone();
+            let pairing_store = self.pairing_store.clone();
             let api_key = self.google_api_key.clone();
             let keys = self.keys.clone();
 
@@ -60,17 +76,81 @@ impl WsServer {
                                     let text = msg.to_text().unwrap();
 
                                     if !authenticated {
-                                        if !crate::auth::is_valid_auth_message(text, &token) {
+                                        let mut auth_ok = false;
+                                        let mut auth_response = None;
+
+                                        if let Ok(event) = serde_json::from_str::<crate::auth::AuthEvent>(text) {
+                                            if event.event == "auth.pair" {
+                                                if let Some(pairing_token) = event.payload.pairing_token {
+                                                    let mut store = pairing_store.lock().await;
+                                                    match store.validate_and_consume_pairing_token(&pairing_token) {
+                                                        Ok(ac) => {
+                                                            auth_ok = true;
+                                                            auth_response = Some(serde_json::json!({
+                                                                "event": "auth.paired",
+                                                                "payload": {
+                                                                    "client_token": ac.client_token
+                                                                }
+                                                            }));
+                                                        }
+                                                        Err(reason) => {
+                                                            auth_response = Some(serde_json::json!({
+                                                                "event": "auth.error",
+                                                                "payload": {
+                                                                    "reason": reason
+                                                                }
+                                                            }));
+                                                        }
+                                                    }
+                                                }
+                                            } else if event.event == "auth.token" {
+                                                if let Some(client_token) = event.payload.client_token {
+                                                    let mut store = pairing_store.lock().await;
+                                                    if store.validate_client_token(&client_token).is_ok() {
+                                                        auth_ok = true;
+                                                        auth_response = Some(serde_json::json!({
+                                                            "event": "auth.ok"
+                                                        }));
+                                                    } else {
+                                                        auth_response = Some(serde_json::json!({
+                                                            "event": "auth.error",
+                                                            "payload": {
+                                                                "reason": "invalid_token"
+                                                            }
+                                                        }));
+                                                    }
+                                                } else if legacy_auth {
+                                                    if let Some(legacy_token) = event.payload.token {
+                                                        if legacy_token == token {
+                                                            auth_ok = true;
+                                                            auth_response = Some(serde_json::json!({
+                                                                "event": "auth.ok"
+                                                            }));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if !auth_ok {
                                             warn!("Authentication failed for {}", addr);
+                                            let resp = auth_response.unwrap_or_else(|| serde_json::json!({
+                                                "event": "auth.error",
+                                                "payload": {
+                                                    "reason": "invalid_auth_request"
+                                                }
+                                            }));
                                             let _ = ws_stream
                                                 .send(
                                                     tokio_tungstenite::tungstenite::Message::Text(
-                                                        "Auth failed".to_string(),
+                                                        serde_json::to_string(&resp).unwrap()
                                                     ),
                                                 )
                                                 .await;
-                                            break;
+                                            // Don't break immediately, let the client read the error
+                                            continue;
                                         }
+                                        
                                         authenticated = true;
                                         info!("Client {} authenticated successfully", addr);
 
@@ -84,11 +164,13 @@ impl WsServer {
                                             info!("Created session: {}", session.id);
                                         }
 
-                                        let _ = ws_stream
-                                            .send(tokio_tungstenite::tungstenite::Message::Text(
-                                                "Auth OK".to_string(),
-                                            ))
-                                            .await;
+                                        if let Some(resp) = auth_response {
+                                            let _ = ws_stream
+                                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                                    serde_json::to_string(&resp).unwrap()
+                                                ))
+                                                .await;
+                                        }
                                         continue;
                                     }
 

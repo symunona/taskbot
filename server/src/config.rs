@@ -13,7 +13,14 @@ pub struct Config {
     #[serde(default)]
     pub keys: HashMap<String, String>,
     pub public_domain: Option<String>,
+    #[serde(default = "default_legacy_auth")]
+    pub legacy_auth: bool,
+    #[serde(default = "default_pairing_ttl_secs")]
+    pub pairing_ttl_secs: u64,
 }
+
+fn default_legacy_auth() -> bool { true }
+fn default_pairing_ttl_secs() -> u64 { 600 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeminiApiKeySource {
@@ -45,6 +52,8 @@ impl Default for Config {
             google_api_key: None,
             keys: HashMap::new(),
             public_domain: None,
+            legacy_auth: true,
+            pairing_ttl_secs: 600,
         }
     }
 }

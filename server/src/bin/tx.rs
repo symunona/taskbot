@@ -20,7 +20,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Pair,
+    Pair {
+        #[arg(short, long)]
+        ttl: Option<u64>,
+    },
     Serve,
     Log {
         #[arg(short, long)]
@@ -31,6 +34,16 @@ enum Commands {
         #[command(subcommand)]
         command: Option<SessionCommands>,
     },
+    Clients {
+        #[command(subcommand)]
+        command: Option<ClientsCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClientsCommands {
+    List,
+    Revoke { id: String },
 }
 
 #[derive(Subcommand)]
@@ -206,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print!("{}", contents);
             }
         }
-        Commands::Pair => {
+        Commands::Pair { ttl } => {
             let pubkey = "mock_pubkey"; // Replace with actual pubkey logic
             let pubkey_base64 = STANDARD.encode(pubkey);
             let addrs = public_address_candidates(&config);
@@ -216,9 +229,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|a| format!("addrs={}", a))
                 .collect::<Vec<_>>()
                 .join("&");
+                
+            let mut pairing_store = tx::pairing_store::PairingStore::new(config.vault_path.join("pairing_store.json"))?;
+            let ttl_secs = ttl.unwrap_or(config.pairing_ttl_secs);
+            let pt = pairing_store.create_pairing_token(ttl_secs)?;
+
             let conn_str = format!(
-                "hermes://{}/{}?{}",
-                pubkey_base64, config.token, addrs_query
+                "hermes://{}/{}?{}&exp={}",
+                pubkey_base64, pt.token, addrs_query, pt.expires_at
             );
 
             println!("Connection string:\n{}", conn_str);
@@ -308,6 +326,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::Clients { command } => {
+            let mut pairing_store = tx::pairing_store::PairingStore::new(config.vault_path.join("pairing_store.json"))?;
+            match command {
+                Some(ClientsCommands::List) | None => {
+                    let clients = pairing_store.list_clients();
+                    if clients.is_empty() {
+                        println!("No authorized clients found.");
+                    } else {
+                        println!(
+                            "{:<36} | {:<20} | {:<20} | {}",
+                            "Client ID", "Paired At", "Last Seen", "Label"
+                        );
+                        println!("{:-<36}-+-{:-<20}-+-{:-<20}-+-{:-<20}", "", "", "", "");
+                        for c in clients {
+                            let paired_at = chrono::DateTime::from_timestamp(c.paired_at as i64, 0)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| c.paired_at.to_string());
+                            let last_seen = c.last_seen.and_then(|ts| {
+                                chrono::DateTime::from_timestamp(ts as i64, 0)
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                            }).unwrap_or_else(|| "Never".to_string());
+                            let label = c.label.unwrap_or_else(|| "None".to_string());
+
+                            println!(
+                                "{:<36} | {:<20} | {:<20} | {}",
+                                c.client_id, paired_at, last_seen, label
+                            );
+                        }
+                    }
+                }
+                Some(ClientsCommands::Revoke { id }) => {
+                    pairing_store.revoke_client(id)?;
+                    println!("Client {} revoked.", id);
+                }
+            }
+        }
         Commands::Serve => {
             init_logging();
             let now = chrono::Local::now();
@@ -349,10 +403,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pkm.watcher.watch()?;
 
             let pkm_arc = Arc::new(pkm);
+            let pairing_store = tx::pairing_store::PairingStore::new(config.vault_path.join("pairing_store.json"))?;
+            let pairing_store_arc = Arc::new(tokio::sync::Mutex::new(pairing_store));
+            
             let ws_server = tx::ws::WsServer::new(
                 config.listen_addr.clone(),
                 config.token.clone(),
+                config.legacy_auth,
                 pkm_arc,
+                pairing_store_arc,
                 resolved_api_key.map(|(key, _)| key),
                 config.keys.clone(),
             );

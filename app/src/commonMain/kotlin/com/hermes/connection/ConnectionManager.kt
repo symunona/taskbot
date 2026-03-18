@@ -12,12 +12,13 @@ class ConnectionManager {
     private var currentUrls: List<String> = emptyList()
     private var currentUrlIndex = 0
     private var currentToken: String? = null
+    private var isPairingFlow: Boolean = false
     private var retryCount = 0
     private val maxRetries = 5
     private var connectJob: kotlinx.coroutines.Job? = null
     
     // Parses: hermes://<pubkey_base64>/<token>?addrs=<ip>:<port>&addrs=<domain>:443
-    fun connectFromString(connectionString: String) {
+    fun connectFromString(connectionString: String, clientToken: String? = null) {
         try {
             if (!connectionString.startsWith("hermes://")) {
                 println("Invalid connection string format")
@@ -32,7 +33,7 @@ class ConnectionManager {
             if (pathParts.size != 2) return
             
             val pubkeyBase64 = pathParts[0]
-            val token = pathParts[1]
+            val pairingToken = pathParts[1]
             
             val queryParts = parts[1].split("&")
             val addrs = mutableListOf<String>()
@@ -47,7 +48,15 @@ class ConnectionManager {
                     if (addr.endsWith(":443")) "wss://$addr" else "ws://$addr"
                 }
                 currentUrlIndex = 0
-                currentToken = token
+                
+                if (!clientToken.isNullOrEmpty()) {
+                    currentToken = clientToken
+                    isPairingFlow = false
+                } else {
+                    currentToken = pairingToken
+                    isPairingFlow = true
+                }
+                
                 retryCount = 0
                 
                 connectJob?.cancel()
@@ -75,7 +84,7 @@ class ConnectionManager {
         try {
             while (retryCount < maxRetries) {
                 val url = currentUrls[currentUrlIndex]
-                webSocketClient.connect(url, token)
+                webSocketClient.connect(url, token, isPairingFlow)
                 
                 // If we get here, the connection closed or failed
                 if (webSocketClient.isManualDisconnect) {

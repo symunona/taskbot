@@ -47,8 +47,10 @@ class WebSocketClient {
     }
     
     private val json = Json { ignoreUnknownKeys = true }
+    
+    var onClientTokenReceived: ((String) -> Unit)? = null
 
-    suspend fun connect(url: String, token: String) {
+    suspend fun connect(url: String, token: String, isPairing: Boolean = false) {
         isManualDisconnect = false
         try {
             _connectionState.value = ConnectionState.Connecting
@@ -57,32 +59,59 @@ class WebSocketClient {
             
             // Send auth
             EventLogger.log("Sending authentication token")
-            val authMsg = """{"event":"auth.token","payload":{"token":"$token"}}"""
+            val authMsg = if (isPairing) {
+                """{"event":"auth.pair","payload":{"pairing_token":"$token"}}"""
+            } else {
+                """{"event":"auth.token","payload":{"client_token":"$token","token":"$token"}}"""
+            }
             session?.send(Frame.Text(authMsg))
             
             // Listen for messages
             for (frame in session?.incoming!!) {
                 if (frame is Frame.Text) {
                     val text = frame.readText()
+                    
+                    // Handle legacy plain text auth responses
                     if (text == "Auth OK") {
-                        EventLogger.log("Authenticated successfully")
+                        EventLogger.log("Authenticated successfully (legacy)")
                         println("Authenticated successfully")
                         _connectionState.value = ConnectionState.Connected
+                        continue
                     } else if (text == "Auth failed") {
-                        EventLogger.log("Authentication failed", isError = true)
+                        EventLogger.log("Authentication failed (legacy)", isError = true)
                         println("Authentication failed")
                         _connectionState.value = ConnectionState.Error
                         session?.close()
                         break
-                    } else {
-                        try {
-                            val event = json.parseToJsonElement(text).jsonObject
-                            EventLogger.log("Received event: ${event["event"]?.jsonPrimitive?.content ?: "unknown"}")
+                    }
+                    
+                    try {
+                        val event = json.parseToJsonElement(text).jsonObject
+                        val eventName = event["event"]?.jsonPrimitive?.content ?: "unknown"
+                        
+                        if (eventName == "auth.paired") {
+                            val clientToken = event["payload"]?.jsonObject?.get("client_token")?.jsonPrimitive?.content
+                            if (clientToken != null) {
+                                EventLogger.log("Paired successfully, received client token")
+                                onClientTokenReceived?.invoke(clientToken)
+                                _connectionState.value = ConnectionState.Connected
+                            }
+                        } else if (eventName == "auth.ok") {
+                            EventLogger.log("Authenticated successfully")
+                            _connectionState.value = ConnectionState.Connected
+                        } else if (eventName == "auth.error") {
+                            val reason = event["payload"]?.jsonObject?.get("reason")?.jsonPrimitive?.content ?: "unknown"
+                            EventLogger.log("Authentication failed: $reason", isError = true)
+                            _connectionState.value = ConnectionState.Error
+                            session?.close()
+                            break
+                        } else {
+                            EventLogger.log("Received event: $eventName")
                             _events.emit(event)
-                        } catch (e: Exception) {
-                            EventLogger.log("Failed to parse event: $text", isError = true)
-                            println("Failed to parse event: $text")
                         }
+                    } catch (e: Exception) {
+                        EventLogger.log("Failed to parse event: $text", isError = true)
+                        println("Failed to parse event: $text")
                     }
                 }
             }
