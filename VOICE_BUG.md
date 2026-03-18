@@ -25,12 +25,22 @@ When pressing the "Voice" toggle in the Android App, the app attempts to start a
 `CloseReason(reason=VIOLATED_POLICY, message=models/gemini-2.0-flash-exp is not found for API version v1alpha, or is not supported for bidiGenerateContent. Call ListMod)`
 **Conclusion**: `models/gemini-2.0-flash-exp` is explicitly not supported for the `bidiGenerateContent` WebSocket endpoint, regardless of whether it is `v1alpha` or `v1beta`.
 
-## Current State & Next Steps
+## Resolution (2026-03-18)
 
-1. **The Core Issue**: We need to find the correct combination of **Model Name** and **API Version** that supports the `BidiGenerateContent` WebSocket endpoint.
-2. **The Timeout Issue**: The app waits for 10 seconds for a `setupComplete` message from the server. Because the WebSocket closes immediately with an error (either 502 or VIOLATED_POLICY), the `setupComplete` deferred is never resolved, causing the app to hang for 10 seconds before failing.
+### Root Causes Found
+1. **Wrong model name**: `models/gemini-2.0-flash-exp` does NOT support `bidiGenerateContent`. Server rejects with `VIOLATED_POLICY`.
+2. **Binary frame handling**: The Gemini Live API sends `setupComplete` and all other responses as **binary WebSocket frames**, not text frames. The code was only handling `Frame.Text` and skipping binary frames entirely.
+3. **No early failure on close**: When the WebSocket closed with an error, `setupComplete` was never completed exceptionally, causing a 10-second timeout hang.
 
-### Recommended Next Steps
-1. **Find the Correct Model**: Research the current Google Gemini API documentation for the correct model string for the Realtime API. It is likely `models/gemini-2.0-flash-realtime-exp` or similar, running on the `v1alpha` endpoint.
-2. **Fix the Timeout Hang**: In `GeminiLiveClient.kt`, when the WebSocket closes or receives a `goAway` message, it should immediately complete the `setupComplete` deferred exceptionally so the UI doesn't hang for 10 seconds. (I added logging for the close reason, but the timeout still occurs).
-3. **Verify Audio Config**: Once the connection succeeds, verify that the `setupMessage` JSON payload matches the exact schema expected by the Realtime API (e.g., `voiceConfig`, `generationConfig`, etc.).
+### Fixes Applied
+1. **Model**: Changed to `models/gemini-2.5-flash-native-audio-preview-12-2025` on `v1alpha` endpoint.
+2. **Binary frames**: `GeminiLiveClient.kt` now decodes both `Frame.Text` and `Frame.Binary` as JSON text.
+3. **Early failure**: `setupComplete` is now completed exceptionally on WebSocket close or `goAway` message.
+4. **Logging**: `EventLogger` now uses `android.util.Log` with tag `Hermes` for `adb logcat -s Hermes` filtering.
+5. **UI errors**: Descriptive user-facing messages instead of raw "Timed out waiting for 10000 ms".
+
+### Verified Working
+- Voice session connects in ~1 second
+- Audio streams bidirectionally (mic → server, server → speaker)
+- Text transcripts display in green voice bubbles in the UI
+- 51+ server messages received in a single test session

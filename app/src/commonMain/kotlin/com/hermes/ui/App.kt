@@ -64,22 +64,23 @@ private fun upsertVoiceTranscript(messages: List<ChatMessage>, transcript: Voice
     }
 
     val lastMessage = messages.lastOrNull()
-    val shouldReplaceLastTranscript = lastMessage?.isVoiceTranscript == true &&
-        lastMessage.role == transcript.role &&
-        (
-            lastMessage.isVoicePartial ||
-                transcript.isPartial ||
-                normalizedText.startsWith(lastMessage.content) ||
-                lastMessage.content.startsWith(normalizedText)
-        )
 
-    if (shouldReplaceLastTranscript) {
-        val existingMessage = lastMessage ?: return messages
-        if (existingMessage.content == normalizedText && existingMessage.isVoicePartial == transcript.isPartial) {
-            return messages
+    // Always merge consecutive voice transcripts from the same role into one bubble
+    if (lastMessage?.isVoiceTranscript == true && lastMessage.role == transcript.role) {
+        val newContent = when {
+            // Partial update: new text extends existing (cumulative transcription)
+            transcript.isPartial || normalizedText.startsWith(lastMessage.content) ->
+                normalizedText
+            lastMessage.isVoicePartial || lastMessage.content.startsWith(normalizedText) ->
+                normalizedText
+            // Same content, skip
+            lastMessage.content == normalizedText -> return messages
+            // New segment from same role: append
+            else -> "${lastMessage.content} ${normalizedText}"
         }
-        return messages.dropLast(1) + existingMessage.copy(
-            content = normalizedText,
+        if (newContent == lastMessage.content) return messages
+        return messages.dropLast(1) + lastMessage.copy(
+            content = newContent,
             isVoicePartial = transcript.isPartial
         )
     }
@@ -868,9 +869,10 @@ fun ChatScreen(
         }
     }
 
-    // Save messages
+    // Save messages (debounced to avoid freezing during voice streaming)
     LaunchedEffect(messages, currentThreadId) {
         if (currentThreadId != null && messages.isNotEmpty()) {
+            kotlinx.coroutines.delay(1000L) // debounce: wait 1s of no changes before saving
             val arr = buildJsonArray {
                 messages.forEach { msg ->
                     add(buildJsonObject {
@@ -886,9 +888,23 @@ fun ChatScreen(
         }
     }
 
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+
+    // Auto-scroll to bottom when messages change, if near the bottom
+    LaunchedEffect(messages.size, messages.lastOrNull()?.content?.length) {
+        val layoutInfo = listState.layoutInfo
+        val lastVisibleIndex = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+        val totalItems = layoutInfo.totalItemsCount
+        // Scroll if within ~2 items of the bottom
+        if (totalItems > 0 && totalItems - lastVisibleIndex <= 3) {
+            listState.animateScrollToItem(totalItems - 1)
+        }
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
         // Message List
         LazyColumn(
+            state = listState,
             modifier = Modifier.weight(1f).padding(horizontal = 10.dp, vertical = 5.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -1141,11 +1157,18 @@ fun ChatScreen(
                             try {
                                 session.start()
                             } catch (e: Throwable) {
-                                EventLogger.log("Voice session failed to start: ${e.message ?: "Unknown error"}", isError = true)
-                                e.printStackTrace()
+                                val errorDetail = e.message ?: "Unknown error"
+                                EventLogger.log("VoiceSession: failed to start: $errorDetail", isError = true)
+                                val userMessage = when {
+                                    "VIOLATED_POLICY" in errorDetail -> "Voice connection rejected: model not supported for live audio. Check API configuration."
+                                    "502" in errorDetail || "Bad Gateway" in errorDetail -> "Voice server unavailable (502). Try again in a moment."
+                                    "Timed out" in errorDetail -> "Voice connection timed out. Check your network and API key."
+                                    "goAway" in errorDetail -> "Voice server disconnected: $errorDetail"
+                                    else -> "Voice session failed: $errorDetail"
+                                }
                                 messages = messages + ChatMessage(
                                     "model",
-                                    "Voice session failed to start: ${e.message ?: "Unknown error"}",
+                                    userMessage,
                                     isToolResult = true
                                 )
                                 if (voiceSession == session) {

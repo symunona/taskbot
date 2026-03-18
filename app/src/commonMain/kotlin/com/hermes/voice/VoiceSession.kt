@@ -7,6 +7,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
@@ -41,18 +42,36 @@ class VoiceSession(
         Dispatchers.Default +
             Job() +
             CoroutineExceptionHandler { _, throwable ->
-                EventLogger.log("Voice session failed: ${throwable.message ?: throwable}", isError = true)
+                EventLogger.log("VoiceSession: uncaught: ${throwable.message ?: throwable}", isError = true)
                 onError?.invoke(throwable)
             }
     )
     private var latestUserTranscript = ""
     private var latestModelTranscript = ""
 
+    // Channel to serialize outgoing audio sends (prevents coroutine explosion)
+    private val audioOutChannel = Channel<ByteArray>(capacity = 5)
+
     private val _transcripts = MutableSharedFlow<VoiceTranscript>()
     val transcripts: SharedFlow<VoiceTranscript> = _transcripts
 
     suspend fun start() {
+        EventLogger.log("VoiceSession: starting...")
         client.connect(systemInstruction, tools)
+        EventLogger.log("VoiceSession: connected, starting audio capture")
+
+        // Single coroutine to send audio - prevents Dispatchers.Default starvation
+        scope.launch {
+            for (chunk in audioOutChannel) {
+                try {
+                    client.sendAudio(chunk)
+                } catch (t: Throwable) {
+                    EventLogger.log("VoiceSession: audio send failed: ${t.message}", isError = true)
+                    onError?.invoke(t)
+                    break
+                }
+            }
+        }
 
         scope.launch {
             client.incomingMessages.collect { message ->
@@ -61,15 +80,10 @@ class VoiceSession(
         }
 
         voiceManager.startRecording { audioData ->
-            scope.launch {
-                try {
-                    client.sendAudio(audioData)
-                } catch (t: Throwable) {
-                    EventLogger.log("Failed to stream audio: ${t.message ?: t}", isError = true)
-                    onError?.invoke(t)
-                }
-            }
+            // Drop oldest if buffer full (capacity=5) to prevent backpressure freeze
+            audioOutChannel.trySend(audioData)
         }
+        EventLogger.log("VoiceSession: recording started")
     }
 
     @OptIn(ExperimentalEncodingApi::class)
@@ -78,8 +92,8 @@ class VoiceSession(
         val toolCall = message["toolCall"]?.jsonObject
 
         if (serverContent != null) {
-            if (serverContent["interrupted"]?.jsonPrimitive?.contentOrNull == "true") {
-                EventLogger.log("Gemini Live response interrupted")
+            if (serverContent["interrupted"] != null) {
+                EventLogger.log("GeminiLive: response interrupted")
                 voiceManager.stopPlayback()
             }
 
@@ -110,15 +124,8 @@ class VoiceSession(
                         voiceManager.playAudio(pcmData)
                     }
                 }
-
-                part["text"]?.jsonPrimitive?.contentOrNull
-                    ?.trim()
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let { text ->
-                        scope.launch {
-                            _transcripts.emit(VoiceTranscript(role = "model", text = text))
-                        }
-                    }
+                // Text parts in modelTurn are model "thinking" - skip.
+                // Real transcription comes via outputTranscription.
             }
         }
 
@@ -140,7 +147,7 @@ class VoiceSession(
                     }
                 }
                 if (responses.isNotEmpty()) {
-                    EventLogger.log("Sending Gemini Live tool response")
+                    EventLogger.log("VoiceSession: sending tool response")
                     client.sendToolResponse(responses)
                 }
             }
@@ -175,6 +182,7 @@ class VoiceSession(
     fun stop() {
         voiceManager.stopRecording()
         voiceManager.stopPlayback()
+        audioOutChannel.close()
         client.disconnect(sendAudioStreamEnd = true)
         scope.cancel()
     }

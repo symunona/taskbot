@@ -9,7 +9,9 @@ import android.content.Intent
 import android.os.Build
 import androidx.core.content.ContextCompat
 import com.hermes.ui.AndroidStorage
+import com.hermes.ui.EventLogger
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -23,6 +25,8 @@ actual class VoiceManager {
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
     private var recordingJob: Job? = null
+    private var playbackJob: Job? = null
+    private val playbackChannel = Channel<ByteArray>(capacity = Channel.UNLIMITED)
     private val scope = CoroutineScope(Dispatchers.IO + Job())
 
     actual fun startRecording(onAudioData: (ByteArray) -> Unit) {
@@ -35,7 +39,7 @@ actual class VoiceManager {
 
         try {
             audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 sampleRate,
                 channelConfig,
                 audioFormat,
@@ -71,7 +75,12 @@ actual class VoiceManager {
         audioRecord?.stop()
         audioRecord?.release()
         audioRecord = null
-        
+        // Also fully release playback resources
+        stopPlayback()
+        audioTrack?.stop()
+        audioTrack?.release()
+        audioTrack = null
+
         AndroidStorage.context?.let { ctx ->
             val intent = Intent(ctx, HermesVoiceService::class.java)
             intent.action = "STOP"
@@ -84,7 +93,9 @@ actual class VoiceManager {
             val sampleRate = 24000
             val channelConfig = AudioFormat.CHANNEL_OUT_MONO
             val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-            val bufferSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+            val minBuf = AudioTrack.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+            // Use 4x min buffer to prevent underruns during streaming
+            val bufferSize = minBuf * 4
 
             audioTrack = AudioTrack(
                 AudioManager.STREAM_MUSIC,
@@ -97,19 +108,35 @@ actual class VoiceManager {
             audioTrack?.play()
         }
 
-        _isPlaying.value = true
-        scope.launch {
-            audioTrack?.write(pcmData, 0, pcmData.size)
-            _isPlaying.value = false
+        // Start single writer coroutine if not running
+        if (playbackJob == null || playbackJob?.isActive != true) {
+            audioTrack?.play() // resume if paused by stopPlayback()
+            playbackJob = scope.launch {
+                _isPlaying.value = true
+                try {
+                    for (chunk in playbackChannel) {
+                        audioTrack?.write(chunk, 0, chunk.size)
+                    }
+                } finally {
+                    _isPlaying.value = false
+                }
+            }
         }
+
+        // Queue the chunk - never blocks (UNLIMITED capacity)
+        playbackChannel.trySend(pcmData)
     }
 
     actual fun stopPlayback() {
-        _isPlaying.value = false
-        audioTrack?.stop()
+        // Cancel writer so it stops mid-chunk
+        playbackJob?.cancel()
+        playbackJob = null
+        // Drain queued audio
+        while (playbackChannel.tryReceive().isSuccess) { /* discard */ }
+        // Pause + flush hardware buffer for immediate silence
+        audioTrack?.pause()
         audioTrack?.flush()
-        // We keep the track around for next playback, or release it? Let's release for now.
-        audioTrack?.release()
-        audioTrack = null
+        _isPlaying.value = false
+        // Keep AudioTrack alive - playAudio() will resume it
     }
 }

@@ -7,13 +7,24 @@ import kotlinx.datetime.Clock
 
 data class LogEvent(val timestamp: Long, val message: String, val isError: Boolean = false)
 
+expect fun platformLog(tag: String, message: String, isError: Boolean)
+
 object EventLogger {
+    const val TAG = "Hermes"
+
     private val _logs = MutableStateFlow<List<LogEvent>>(emptyList())
     val logs: StateFlow<List<LogEvent>> = _logs.asStateFlow()
 
+    private const val MAX_LOGS = 200
+
     fun log(message: String, isError: Boolean = false) {
-        println("EventLogger: $message")
+        platformLog(TAG, message, isError)
         val event = LogEvent(Clock.System.now().toEpochMilliseconds(), message, isError)
-        _logs.value = _logs.value + event
+        val current = _logs.value
+        _logs.value = if (current.size >= MAX_LOGS) {
+            current.drop(current.size - MAX_LOGS + 1) + event
+        } else {
+            current + event
+        }
     }
 }

@@ -45,30 +45,35 @@ class GeminiLiveClient(private val apiKey: String) {
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val json = Json { ignoreUnknownKeys = true }
     private var setupComplete = CompletableDeferred<Unit>()
+    private var audioFrameCount = 0
 
-    private val _incomingMessages = MutableSharedFlow<JsonObject>(extraBufferCapacity = 64)
+    private val _incomingMessages = MutableSharedFlow<JsonObject>(extraBufferCapacity = 256)
     val incomingMessages: SharedFlow<JsonObject> = _incomingMessages
 
     suspend fun connect(systemInstruction: String? = null, tools: JsonArray? = null) {
         val url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=$apiKey"
-        EventLogger.log("Connecting Gemini Live session")
+        EventLogger.log("GeminiLive: connecting (v1alpha, key=${apiKey.take(4)}...)")
         session = client.webSocketSession(url)
         setupComplete = CompletableDeferred()
 
+        audioFrameCount = 0
         receiveJob?.cancel()
         receiveJob = scope.launch {
             try {
                 for (frame in session!!.incoming) {
-                    if (frame !is Frame.Text) {
-                        EventLogger.log("Gemini Live non-text frame received: ${frame.frameType}")
-                        continue
+                    val payload = when (frame) {
+                        is Frame.Text -> frame.readText()
+                        is Frame.Binary -> frame.readBytes().decodeToString()
+                        else -> continue
                     }
-                    val payload = frame.readText()
-                    EventLogger.log("Gemini Live raw message: $payload")
                     val message = json.parseToJsonElement(payload).jsonObject
+                    // Only log control messages, not audio data frames
+                    val hasAudio = message["serverContent"]?.jsonObject
+                        ?.get("modelTurn")?.jsonObject
+                        ?.get("parts") != null
                     when {
                         message["setupComplete"] != null -> {
-                            EventLogger.log("Gemini Live session configured")
+                            EventLogger.log("GeminiLive: setup complete")
                             if (!setupComplete.isCompleted) {
                                 setupComplete.complete(Unit)
                             }
@@ -79,33 +84,53 @@ class GeminiLiveClient(private val apiKey: String) {
                                 ?.jsonPrimitive
                                 ?.contentOrNull
                                 ?: "Server requested disconnect"
-                            EventLogger.log("Gemini Live goAway: $reason", isError = true)
+                            EventLogger.log("GeminiLive: goAway: $reason", isError = true)
+                            if (!setupComplete.isCompleted) {
+                                setupComplete.completeExceptionally(RuntimeException("GeminiLive: goAway - $reason"))
+                            }
                         }
                         message["toolCallCancellation"] != null -> {
-                            EventLogger.log("Gemini Live cancelled pending tool call")
+                            EventLogger.log("GeminiLive: tool call cancelled")
+                        }
+                        message["toolCall"] != null -> {
+                            EventLogger.log("GeminiLive: tool call received")
+                        }
+                        hasAudio -> {
+                            audioFrameCount++
+                            if (audioFrameCount % 50 == 1) {
+                                EventLogger.log("GeminiLive: audio frames received: $audioFrameCount")
+                            }
                         }
                         else -> {
-                            EventLogger.log("Gemini Live message received")
+                            EventLogger.log("GeminiLive: ${message.keys}")
                         }
                     }
                     _incomingMessages.emit(message)
                 }
                 val reason = session?.closeReason?.await()
-                EventLogger.log("Gemini Live incoming channel closed normally. Reason: $reason")
+                EventLogger.log("GeminiLive: channel closed. Reason: $reason")
+                if (!setupComplete.isCompleted) {
+                    val msg = reason?.message?.takeIf { it.isNotBlank() }
+                        ?: reason?.knownReason?.name
+                        ?: "WebSocket closed before setup completed"
+                    setupComplete.completeExceptionally(RuntimeException("GeminiLive: $msg"))
+                }
             } catch (e: Exception) {
                 if (!setupComplete.isCompleted) {
                     setupComplete.completeExceptionally(e)
                 }
-                EventLogger.log("Gemini Live receive failed: ${e.message ?: e}", isError = true)
+                EventLogger.log("GeminiLive: receive failed: ${e.message ?: e}", isError = true)
             }
         }
 
         val setupMessage = buildJsonObject {
             put("setup", buildJsonObject {
-                put("model", "models/gemini-2.0-flash-exp")
+                put("model", "models/gemini-2.5-flash-native-audio-preview-12-2025")
                 put("generationConfig", buildJsonObject {
                     put("responseModalities", buildJsonArray { add(JsonPrimitive("AUDIO")) })
                 })
+                put("inputAudioTranscription", buildJsonObject {})
+                put("outputAudioTranscription", buildJsonObject {})
                 if (systemInstruction != null) {
                     put("systemInstruction", buildJsonObject {
                         put("parts", buildJsonArray {
@@ -123,6 +148,7 @@ class GeminiLiveClient(private val apiKey: String) {
             })
         }
 
+        EventLogger.log("GeminiLive: sending setup: ${setupMessage.toString().take(300)}")
         sendJson(setupMessage)
         withTimeout(10_000L) {
             setupComplete.await()
