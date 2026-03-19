@@ -32,6 +32,7 @@ data class VoiceTranscript(
 class VoiceSession(
     private val apiKey: String,
     private val systemInstruction: String? = null,
+    private val history: JsonArray? = null,
     private val tools: JsonArray? = null,
     private val toolRegistry: ToolRegistry? = null,
     private val onError: ((Throwable) -> Unit)? = null
@@ -50,25 +51,33 @@ class VoiceSession(
     private var latestModelTranscript = ""
 
     // Channel to serialize outgoing audio sends (prevents coroutine explosion)
-    private val audioOutChannel = Channel<ByteArray>(capacity = 5)
+    private val audioOutChannel = Channel<ByteArray>(
+        capacity = 50,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
+    )
 
     private val _transcripts = MutableSharedFlow<VoiceTranscript>()
     val transcripts: SharedFlow<VoiceTranscript> = _transcripts
 
     suspend fun start() {
         EventLogger.log("VoiceSession: starting...")
-        client.connect(systemInstruction, tools)
+        client.connect(systemInstruction, tools, history)
         EventLogger.log("VoiceSession: connected, starting audio capture")
 
         // Single coroutine to send audio - prevents Dispatchers.Default starvation
         scope.launch {
+            var buffered = ByteArray(0)
             for (chunk in audioOutChannel) {
-                try {
-                    client.sendAudio(chunk)
-                } catch (t: Throwable) {
-                    EventLogger.log("VoiceSession: audio send failed: ${t.message}", isError = true)
-                    onError?.invoke(t)
-                    break
+                buffered += chunk
+                if (buffered.size >= 4096) {
+                    try {
+                        client.sendAudio(buffered)
+                        buffered = ByteArray(0)
+                    } catch (t: Throwable) {
+                        EventLogger.log("VoiceSession: audio send failed: ${t.message}", isError = true)
+                        onError?.invoke(t)
+                        break
+                    }
                 }
             }
         }
