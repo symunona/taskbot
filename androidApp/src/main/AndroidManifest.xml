@@ -32,6 +32,13 @@
             android:name="com.hermes.voice.HermesVoiceService"
             android:foregroundServiceType="microphone"
             android:exported="false" />
+            
+        <activity
+            android:name="com.hermes.ui.MyCaptureActivity"
+            android:screenOrientation="fullSensor"
+            android:stateNotNeeded="true"
+            android:theme="@style/zxing_CaptureTheme"
+            android:windowSoftInputMode="stateAlwaysHidden" />
     </application>
 
 </manifest>

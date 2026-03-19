@@ -12,6 +12,8 @@ server-build:
 server-lint:
     cargo clippy --manifest-path server/Cargo.toml --all-targets
 
+alias apk := android-build
+
 [group('android')]
 android-build:
     ./build_apk.sh

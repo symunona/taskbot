@@ -50,7 +50,7 @@ class GeminiLiveClient(private val apiKey: String) {
     private val _incomingMessages = MutableSharedFlow<JsonObject>(extraBufferCapacity = 256)
     val incomingMessages: SharedFlow<JsonObject> = _incomingMessages
 
-    suspend fun connect(systemInstruction: String? = null, tools: JsonArray? = null) {
+    suspend fun connect(systemInstruction: String? = null, tools: JsonArray? = null, history: JsonArray? = null) {
         val url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=$apiKey"
         EventLogger.log("GeminiLive: connecting (v1alpha, key=${apiKey.take(4)}...)")
         session = client.webSocketSession(url)
@@ -152,6 +152,17 @@ class GeminiLiveClient(private val apiKey: String) {
         sendJson(setupMessage)
         withTimeout(10_000L) {
             setupComplete.await()
+        }
+
+        if (history != null && history.isNotEmpty()) {
+            val clientContentMessage = buildJsonObject {
+                put("clientContent", buildJsonObject {
+                    put("turns", history)
+                    put("turnComplete", true)
+                })
+            }
+            EventLogger.log("GeminiLive: sending history")
+            sendJson(clientContentMessage)
         }
     }
 

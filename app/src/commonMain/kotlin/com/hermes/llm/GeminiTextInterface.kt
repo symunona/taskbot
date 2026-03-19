@@ -10,15 +10,20 @@ class GeminiTextInterface(
     private val toolRegistry: ToolRegistry
 ) {
     private val api = GeminiApi(apiKey)
-    private val history = mutableListOf<Content>()
     
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating
 
-    suspend fun generateResponseStream(userText: String, systemPrompt: String? = null, onChunk: (String) -> Unit): String {
+    suspend fun generateResponseStream(
+        userText: String, 
+        systemPrompt: String? = null, 
+        chatHistory: List<Content> = emptyList(),
+        onChunk: (String) -> Unit
+    ): String {
         _isGenerating.value = true
         try {
-            history.add(Content("user", listOf(Part(text = userText))))
+            val currentHistory = chatHistory.toMutableList()
+            currentHistory.add(Content("user", listOf(Part(text = userText))))
             
             var fullResponseText = ""
             var keepGoing = true
@@ -30,7 +35,7 @@ class GeminiTextInterface(
                 } else null
                 
                 val request = GeminiRequest(
-                    contents = history.toList(),
+                    contents = currentHistory.toList(),
                     tools = tools,
                     systemInstruction = systemInstruction
                 )
@@ -59,12 +64,12 @@ class GeminiTextInterface(
                     val parts = mutableListOf<Part>()
                     if (currentChunkText.isNotEmpty()) parts.add(Part(text = currentChunkText))
                     if (functionCall != null) parts.add(Part(functionCall = functionCall))
-                    history.add(Content("model", parts))
+                    currentHistory.add(Content("model", parts))
                 }
                 
                 if (functionCall != null) {
                     val result = toolRegistry.execute(functionCall!!.name, functionCall!!.args)
-                    history.add(Content("user", listOf(Part(
+                    currentHistory.add(Content("user", listOf(Part(
                         functionResponse = FunctionResponse(
                             name = functionCall!!.name,
                             response = result

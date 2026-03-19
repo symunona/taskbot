@@ -14,7 +14,12 @@ class MockLlmInterface(
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating
 
-    suspend fun generateResponseStream(userText: String, systemPrompt: String? = null, onChunk: (String) -> Unit): String {
+    suspend fun generateResponseStream(
+        userText: String, 
+        systemPrompt: String? = null, 
+        chatHistory: List<Content> = emptyList(),
+        onChunk: (String) -> Unit
+    ): String {
         _isGenerating.value = true
         try {
             // Simulate network delay

@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.RecordVoiceOver
 import com.hermes.connection.*
 import com.hermes.llm.*
 import com.hermes.tools.*
@@ -426,6 +427,20 @@ fun MainAppScreen(
                     IconButton(onClick = { coroutineScope.launch { scaffoldState.drawerState.open() } }) {
                         Icon(Icons.Filled.Menu, contentDescription = "Menu")
                     }
+                },
+                actions = {
+                    val statusColor = when (connectionState) {
+                        com.hermes.connection.WebSocketClient.ConnectionState.Connected -> Color.Green
+                        com.hermes.connection.WebSocketClient.ConnectionState.Connecting -> Color.Yellow
+                        com.hermes.connection.WebSocketClient.ConnectionState.Error -> Color.Red
+                        com.hermes.connection.WebSocketClient.ConnectionState.Disconnected -> Color.Gray
+                    }
+                    Box(
+                        modifier = Modifier
+                            .padding(end = 16.dp)
+                            .size(12.dp)
+                            .background(statusColor, CircleShape)
+                    )
                 }
             )
         },
@@ -1108,6 +1123,114 @@ fun ChatScreen(
                     .padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                IconButton(onClick = {
+                    if (!canUseAssistantFeatures) {
+                        showPlatformToast("Gemini API key is missing. Add it in Settings or connect to a server that provides one.")
+                        return@IconButton
+                    }
+                    if (isVoiceActive) {
+                        stopVoiceSession()
+                    } else {
+                        coroutineScope.launch {
+                            ensureThreadExists()
+                            val toolsArray = buildJsonArray {
+                                toolRegistry.getDeclarations().forEach { decl ->
+                                    add(buildJsonObject {
+                                        put("name", decl.name)
+                                        put("description", decl.description)
+                                        put("parameters", decl.parameters)
+                                    })
+                                }
+                            }
+
+                            val personaContext = "You are Hermes, a helpful assistant with access to a remote server. Use tools when necessary."
+                            
+                            val historyArray = buildJsonArray {
+                                messages.filter { it.content.isNotBlank() }.forEach { msg ->
+                                    // Gemini requires "user" or "model" roles
+                                    val role = if (msg.role == "user") "user" else "model"
+                                    add(buildJsonObject {
+                                        put("role", role)
+                                        put("parts", buildJsonArray {
+                                            add(buildJsonObject {
+                                                put("text", msg.content)
+                                            })
+                                        })
+                                    })
+                                }
+                            }
+
+                            val session = VoiceSession(
+                                apiKey = apiKey,
+                                systemInstruction = personaContext,
+                                history = historyArray,
+                                tools = toolsArray,
+                                toolRegistry = toolRegistry,
+                                onError = { throwable ->
+                                    messages = messages + ChatMessage(
+                                        "model",
+                                        "Voice session error: ${throwable.message ?: "Unknown error"}",
+                                        isToolResult = true
+                                    )
+                                    stopVoiceSession()
+                                }
+                            )
+                            voiceSession = session
+                            isVoiceActive = true
+                            voiceCollectorJob = launch {
+                                session.transcripts.collect { transcript ->
+                                    messages = upsertVoiceTranscript(messages, transcript)
+                                }
+                            }
+
+                            isVoiceConnecting = true
+                            try {
+                                session.start()
+                                isVoiceConnecting = false
+                            } catch (e: Throwable) {
+                                isVoiceConnecting = false
+                                val errorDetail = e.message ?: "Unknown error"
+                                EventLogger.log("VoiceSession: failed to start: $errorDetail", isError = true)
+                                val userMessage = when {
+                                    "VIOLATED_POLICY" in errorDetail -> "Voice connection rejected: model not supported for live audio. Check API configuration."
+                                    "502" in errorDetail || "Bad Gateway" in errorDetail -> "Voice server unavailable (502). Try again in a moment."
+                                    "Timed out" in errorDetail -> "Voice connection timed out. Check your network and API key."
+                                    "goAway" in errorDetail -> "Voice server disconnected: $errorDetail"
+                                    else -> "Voice session failed: $errorDetail"
+                                }
+                                messages = messages + ChatMessage(
+                                    "model",
+                                    userMessage,
+                                    isToolResult = true
+                                )
+                                if (voiceSession == session) {
+                                    stopVoiceSession()
+                                } else {
+                                    voiceCollectorJob?.cancel()
+                                }
+                            }
+                        }
+                    }
+                }) {
+                    if (isVoiceConnecting) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(24.dp),
+                            color = Color.White,
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Icon(
+                            if (isVoiceActive) Icons.Filled.Close else Icons.Filled.RecordVoiceOver,
+                            contentDescription = "Toggle Voice",
+                            tint = when {
+                                !canUseAssistantFeatures -> Color.Gray
+                                isVoiceActive -> Color.Red
+                                else -> Color.White
+                            }
+                        )
+                    }
+                }
+
                 OutlinedTextField(
                     value = input,
                     onValueChange = { input = it },
@@ -1184,10 +1307,17 @@ fun ChatScreen(
                                 messages = messages + ChatMessage("model", "")
                                 val modelMsgIndex = messages.lastIndex
                                 
+                                val previousMessages = messages.dropLast(2)
+                                val historyContent = previousMessages.filter { it.content.isNotBlank() }.map { msg ->
+                                    val role = if (msg.role == "user") "user" else "model"
+                                    Content(role, listOf(Part(text = msg.content)))
+                                }
+                                
                                 val response = if (useMockLlm) {
                                     mockLlm.generateResponseStream(
                                         userText = text,
-                                        systemPrompt = "You are Hermes, a helpful assistant with access to a remote server. Use tools when necessary."
+                                        systemPrompt = "You are Hermes, a helpful assistant with access to a remote server. Use tools when necessary.",
+                                        chatHistory = historyContent
                                     ) { chunk ->
                                         messages = messages.toMutableList().apply {
                                             val current = this[modelMsgIndex]
@@ -1197,7 +1327,8 @@ fun ChatScreen(
                                 } else {
                                     geminiLlm.generateResponseStream(
                                         userText = text,
-                                        systemPrompt = "You are Hermes, a helpful assistant with access to a remote server. Use tools when necessary."
+                                        systemPrompt = "You are Hermes, a helpful assistant with access to a remote server. Use tools when necessary.",
+                                        chatHistory = historyContent
                                     ) { chunk ->
                                         messages = messages.toMutableList().apply {
                                             val current = this[modelMsgIndex]
@@ -1225,100 +1356,7 @@ fun ChatScreen(
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", tint = if (isGenerating || input.isBlank()) Color.Gray else Color.White)
                         }
                     }
-                )
-                IconButton(onClick = {
-                    if (!canUseAssistantFeatures) {
-                        showPlatformToast("Gemini API key is missing. Add it in Settings or connect to a server that provides one.")
-                        return@IconButton
-                    }
-                    if (isVoiceActive) {
-                        stopVoiceSession()
-                    } else {
-                        coroutineScope.launch {
-                            ensureThreadExists()
-                            val toolsArray = buildJsonArray {
-                                toolRegistry.getDeclarations().forEach { decl ->
-                                    add(buildJsonObject {
-                                        put("name", decl.name)
-                                        put("description", decl.description)
-                                        put("parameters", decl.parameters)
-                                    })
-                                }
-                            }
-
-                            val threadContext = messages.joinToString("\n") { "${it.role}: ${it.content}" }
-                            val personaContext = "You are Hermes, a helpful assistant with access to a remote server. Use tools when necessary.\n\nCurrent thread context:\n$threadContext"
-
-                            val session = VoiceSession(
-                                apiKey = apiKey,
-                                systemInstruction = personaContext,
-                                tools = toolsArray,
-                                toolRegistry = toolRegistry,
-                                onError = { throwable ->
-                                    messages = messages + ChatMessage(
-                                        "model",
-                                        "Voice session error: ${throwable.message ?: "Unknown error"}",
-                                        isToolResult = true
-                                    )
-                                    stopVoiceSession()
-                                }
-                            )
-                            voiceSession = session
-                            isVoiceActive = true
-                            voiceCollectorJob = launch {
-                                session.transcripts.collect { transcript ->
-                                    messages = upsertVoiceTranscript(messages, transcript)
-                                }
-                            }
-
-                            isVoiceConnecting = true
-                            try {
-                                session.start()
-                                isVoiceConnecting = false
-                            } catch (e: Throwable) {
-                                isVoiceConnecting = false
-                                val errorDetail = e.message ?: "Unknown error"
-                                EventLogger.log("VoiceSession: failed to start: $errorDetail", isError = true)
-                                val userMessage = when {
-                                    "VIOLATED_POLICY" in errorDetail -> "Voice connection rejected: model not supported for live audio. Check API configuration."
-                                    "502" in errorDetail || "Bad Gateway" in errorDetail -> "Voice server unavailable (502). Try again in a moment."
-                                    "Timed out" in errorDetail -> "Voice connection timed out. Check your network and API key."
-                                    "goAway" in errorDetail -> "Voice server disconnected: $errorDetail"
-                                    else -> "Voice session failed: $errorDetail"
-                                }
-                                messages = messages + ChatMessage(
-                                    "model",
-                                    userMessage,
-                                    isToolResult = true
-                                )
-                                if (voiceSession == session) {
-                                    stopVoiceSession()
-                                } else {
-                                    voiceCollectorJob?.cancel()
-                                }
-                            }
-                        }
-                    }
-                }) {
-                    if (isVoiceConnecting) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(24.dp),
-                            color = Color.White,
-                            strokeWidth = 2.dp
-                        )
-                    } else {
-                        Icon(
-                            if (isVoiceActive) Icons.Filled.Close else Icons.Filled.PlayArrow,
-                            contentDescription = "Toggle Voice",
-                            tint = when {
-                                !canUseAssistantFeatures -> Color.Gray
-                                isVoiceActive -> Color.Red
-                                else -> Color.White
-                            }
-                        )
-                    }
-                }
-            }
+                )            }
         }
     }
 }
