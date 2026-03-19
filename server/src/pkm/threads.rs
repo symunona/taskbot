@@ -37,20 +37,16 @@ impl Default for ThreadFrontmatter {
 
 pub struct ThreadManager {
     threads_dir: PathBuf,
-    archive_dir: PathBuf,
 }
 
 impl ThreadManager {
     pub fn new(vault_path: &Path) -> Self {
         let threads_dir = vault_path.join("robot_memory/threads");
-        let archive_dir = vault_path.join("robot_memory/threads_archive");
 
         fs::create_dir_all(&threads_dir).unwrap_or_default();
-        fs::create_dir_all(&archive_dir).unwrap_or_default();
 
         Self {
             threads_dir,
-            archive_dir,
         }
     }
 
@@ -131,6 +127,59 @@ impl ThreadManager {
         Err("Thread not found".into())
     }
 
+    pub fn archive_segment(
+        &self,
+        thread_id: &str,
+        summary: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for entry in fs::read_dir(&self.threads_dir)?.flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "md") {
+                let content = fs::read_to_string(entry.path())?;
+                if let Some((fm_str, body)) = Self::parse_file(&content) {
+                    if let Ok(mut fm) = serde_yaml::from_str::<ThreadFrontmatter>(&fm_str) {
+                        if fm.thread_id == thread_id {
+                            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                            
+                            // Archive the current content
+                            let mut archive_fm = fm.clone();
+                            archive_fm.status = "archived".to_string();
+                            if let Some(s) = summary {
+                                archive_fm.summary = s.to_string();
+                            }
+                            let archive_content = format!("---\n{}\n---\n{}", serde_yaml::to_string(&archive_fm)?, body);
+                            
+                            use chrono::{DateTime, Utc};
+                            let dt = DateTime::<Utc>::from(SystemTime::now());
+                            let year = dt.format("%Y").to_string();
+                            let month = dt.format("%m").to_string();
+                            let date_str = dt.format("%Y-%m-%d").to_string();
+                            
+                            let slug = archive_fm.summary.to_lowercase().replace(" ", "-").chars().filter(|c| c.is_alphanumeric() || *c == '-').collect::<String>();
+                            let slug = if slug.is_empty() { format!("segment-{}", timestamp) } else { slug };
+                            
+                            let archive_filename = format!("{}-{}.md", date_str, slug);
+                            let target_dir = self.threads_dir.join(&year).join(&month);
+                            fs::create_dir_all(&target_dir).unwrap_or_default();
+                            
+                            let archive_path = target_dir.join(archive_filename);
+                            fs::write(&archive_path, archive_content)?;
+                            
+                            // Reset current thread body and update summary
+                            if let Some(s) = summary {
+                                fm.summary = s.to_string();
+                            }
+                            fm.last_active = timestamp.to_string();
+                            let new_content = format!("---\n{}\n---\n", serde_yaml::to_string(&fm)?);
+                            fs::write(entry.path(), new_content)?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        Err("Thread not found".into())
+    }
+
     pub fn close_thread(&self, thread_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         for entry in fs::read_dir(&self.threads_dir)?.flatten() {
             if entry.path().extension().is_some_and(|ext| ext == "md") {
@@ -141,7 +190,21 @@ impl ThreadManager {
                             fm.status = "archived".to_string();
                             let new_content =
                                 format!("---\n{}\n---\n{}", serde_yaml::to_string(&fm)?, body);
-                            let new_path = self.archive_dir.join(entry.file_name());
+                                
+                            use chrono::{DateTime, Utc};
+                            let dt = DateTime::<Utc>::from(SystemTime::now());
+                            let year = dt.format("%Y").to_string();
+                            let month = dt.format("%m").to_string();
+                            let date_str = dt.format("%Y-%m-%d").to_string();
+                            
+                            let slug = fm.summary.to_lowercase().replace(" ", "-").chars().filter(|c| c.is_alphanumeric() || *c == '-').collect::<String>();
+                            let slug = if slug.is_empty() { format!("thread-{}", fm.created) } else { slug };
+                            
+                            let archive_filename = format!("{}-{}.md", date_str, slug);
+                            let target_dir = self.threads_dir.join(&year).join(&month);
+                            fs::create_dir_all(&target_dir).unwrap_or_default();
+                            
+                            let new_path = target_dir.join(archive_filename);
                             fs::write(&new_path, new_content)?;
                             fs::remove_file(entry.path())?;
                             return Ok(());

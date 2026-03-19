@@ -1,3 +1,7 @@
+pub mod kb_handlers;
+pub mod thread_handlers;
+pub mod history_handlers;
+
 use crate::pkm::Pkm;
 use crate::pairing_store::PairingStore;
 use futures_util::{SinkExt, StreamExt};
@@ -179,11 +183,22 @@ impl WsServer {
                                     {
                                         info!("Received event: {} from {}", envelope.event, addr);
                                         let response = match envelope.event.as_str() {
-                                            "kb.get" => Self::handle_kb_get(envelope),
-                                            "kb.create" => Self::handle_kb_create(envelope),
-                                            "kb.update" => Self::handle_kb_update(envelope),
-                                            "kb.delete" => Self::handle_kb_delete(envelope),
-                                            "kb.search" => Self::handle_kb_search(envelope),
+                                            "kb.get" => kb_handlers::handle_kb_get(envelope, &pkm),
+                                            "kb.create" => kb_handlers::handle_kb_create(envelope, &pkm),
+                                            "kb.update" => kb_handlers::handle_kb_update(envelope, &pkm),
+                                            "kb.edit" => kb_handlers::handle_kb_edit(envelope, &pkm),
+                                            "kb.delete" => kb_handlers::handle_kb_delete(envelope, &pkm),
+                                            "kb.rename" => kb_handlers::handle_kb_rename(envelope, &pkm),
+                                            "kb.move" => kb_handlers::handle_kb_move(envelope, &pkm),
+                                            "kb.search" => kb_handlers::handle_kb_search(envelope, &pkm),
+                                            "kb.list" => kb_handlers::handle_kb_list(envelope, &pkm),
+                                            "kb.list_all" => kb_handlers::handle_kb_list_all(envelope, &pkm),
+                                            "kb.tree" => kb_handlers::handle_kb_tree(envelope, &pkm),
+                                            "kb.mkdir" => kb_handlers::handle_kb_mkdir(envelope, &pkm),
+                                            "kb.search_re" => kb_handlers::handle_kb_search_re(envelope, &pkm),
+                                            "kb.sr_file" => kb_handlers::handle_kb_sr_file(envelope, &pkm),
+                                            "kb.sr_global" => kb_handlers::handle_kb_sr_global(envelope, &pkm),
+                                            "kb.read_notes" => kb_handlers::handle_kb_read_notes(envelope, &pkm),
                                             "system.info" => {
                                                 Self::handle_system_info(envelope, &pkm)
                                             }
@@ -194,17 +209,23 @@ impl WsServer {
                                                 Self::handle_system_config_get(envelope, &api_key, &keys)
                                             }
                                             "thread.list" => {
-                                                Self::handle_thread_list(envelope, &pkm)
+                                                thread_handlers::handle_thread_list(envelope, &pkm)
                                             }
                                             "thread.create" => {
-                                                Self::handle_thread_create(envelope, &pkm)
+                                                thread_handlers::handle_thread_create(envelope, &pkm)
                                             }
-                                            "thread.get" => Self::handle_thread_get(envelope, &pkm),
+                                            "thread.get" => thread_handlers::handle_thread_get(envelope, &pkm),
                                             "thread.append" => {
-                                                Self::handle_thread_append(envelope, &pkm)
+                                                thread_handlers::handle_thread_append(envelope, &pkm)
                                             }
                                             "thread.close" => {
-                                                Self::handle_thread_close(envelope, &pkm)
+                                                thread_handlers::handle_thread_close(envelope, &pkm)
+                                            }
+                                            "thread.archive_segment" => {
+                                                thread_handlers::handle_thread_archive_segment(envelope, &pkm)
+                                            }
+                                            "history.save_batch" => {
+                                                history_handlers::handle_history_save_batch(envelope, &pkm)
                                             }
                                             _ => {
                                                 warn!("Unknown event received: {}", envelope.event);
@@ -238,34 +259,6 @@ impl WsServer {
             });
         }
         Ok(())
-    }
-
-    fn handle_kb_get(req: EventEnvelope) -> EventEnvelope {
-        Self::create_response(
-            req.id,
-            "kb.result",
-            serde_json::json!({"status": "ok", "content": "mock content"}),
-        )
-    }
-
-    fn handle_kb_create(req: EventEnvelope) -> EventEnvelope {
-        Self::create_response(req.id, "kb.created", serde_json::json!({"status": "ok"}))
-    }
-
-    fn handle_kb_update(req: EventEnvelope) -> EventEnvelope {
-        Self::create_response(req.id, "kb.updated", serde_json::json!({"status": "ok"}))
-    }
-
-    fn handle_kb_delete(req: EventEnvelope) -> EventEnvelope {
-        Self::create_response(req.id, "kb.deleted", serde_json::json!({"status": "ok"}))
-    }
-
-    fn handle_kb_search(req: EventEnvelope) -> EventEnvelope {
-        Self::create_response(
-            req.id,
-            "kb.search.result",
-            serde_json::json!({"status": "ok", "results": []}),
-        )
     }
 
     fn handle_system_info(req: EventEnvelope, pkm: &Arc<Pkm>) -> EventEnvelope {
@@ -363,84 +356,7 @@ impl WsServer {
         )
     }
 
-    fn handle_thread_list(req: EventEnvelope, pkm: &Arc<Pkm>) -> EventEnvelope {
-        match pkm.threads.list_threads() {
-            Ok(threads) => Self::create_response(
-                req.id,
-                "thread.list.result",
-                serde_json::json!({"threads": threads}),
-            ),
-            Err(e) => Self::error_response(req.id, e.to_string()),
-        }
-    }
-
-    fn handle_thread_create(req: EventEnvelope, pkm: &Arc<Pkm>) -> EventEnvelope {
-        match pkm.threads.create_thread() {
-            Ok(thread) => Self::create_response(
-                req.id,
-                "thread.create.result",
-                serde_json::json!({"thread": thread}),
-            ),
-            Err(e) => Self::error_response(req.id, e.to_string()),
-        }
-    }
-
-    fn handle_thread_get(req: EventEnvelope, pkm: &Arc<Pkm>) -> EventEnvelope {
-        let thread_id = req
-            .payload
-            .get("thread_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        match pkm.threads.get_thread(thread_id) {
-            Ok(Some((thread, content))) => Self::create_response(
-                req.id,
-                "thread.get.result",
-                serde_json::json!({"thread": thread, "content": content}),
-            ),
-            Ok(None) => Self::error_response(req.id, "Thread not found".to_string()),
-            Err(e) => Self::error_response(req.id, e.to_string()),
-        }
-    }
-
-    fn handle_thread_append(req: EventEnvelope, pkm: &Arc<Pkm>) -> EventEnvelope {
-        let thread_id = req
-            .payload
-            .get("thread_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let message = req
-            .payload
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        match pkm.threads.append_to_thread(thread_id, message) {
-            Ok(_) => Self::create_response(
-                req.id,
-                "thread.append.result",
-                serde_json::json!({"status": "ok"}),
-            ),
-            Err(e) => Self::error_response(req.id, e.to_string()),
-        }
-    }
-
-    fn handle_thread_close(req: EventEnvelope, pkm: &Arc<Pkm>) -> EventEnvelope {
-        let thread_id = req
-            .payload
-            .get("thread_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        match pkm.threads.close_thread(thread_id) {
-            Ok(_) => Self::create_response(
-                req.id,
-                "thread.close.result",
-                serde_json::json!({"status": "ok"}),
-            ),
-            Err(e) => Self::error_response(req.id, e.to_string()),
-        }
-    }
-
-    fn create_response(ref_id: String, event: &str, payload: Value) -> EventEnvelope {
+    pub fn create_response(ref_id: String, event: &str, payload: Value) -> EventEnvelope {
         EventEnvelope {
             event: event.to_string(),
             id: uuid::Uuid::new_v4().to_string(),
@@ -453,7 +369,7 @@ impl WsServer {
         }
     }
 
-    fn error_response(ref_id: String, error: String) -> EventEnvelope {
+    pub fn error_response(ref_id: String, error: String) -> EventEnvelope {
         Self::create_response(ref_id, "error", serde_json::json!({"error": error}))
     }
 }

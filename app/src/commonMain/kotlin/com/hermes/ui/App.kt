@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import com.hermes.connection.*
 import com.hermes.llm.*
 import com.hermes.tools.*
+import com.hermes.history.SyncQueue
 import com.hermes.voice.VoiceSession
 import com.hermes.voice.VoiceTranscript
 import kotlinx.coroutines.Job
@@ -754,13 +755,37 @@ fun ChatScreen(
     currentThreadId: String?,
     onCurrentThreadIdChange: (String?) -> Unit
 ) {
-    val toolRegistry = remember {
-        ToolRegistry().apply {
-            register(RemoteReadFileTool(connectionManager.webSocketClient))
-            register(RemoteCreateFileTool(connectionManager.webSocketClient))
-            register(RemoteSearchKeywordTool(connectionManager.webSocketClient))
-            register(RemoteSystemInfoTool(connectionManager.webSocketClient))
-        }
+    val coroutineScope = rememberCoroutineScope()
+    val syncQueue = remember { SyncQueue(connectionManager.webSocketClient, coroutineScope) }
+    
+    var messages by remember { mutableStateOf(listOf<ChatMessage>()) }
+
+    val toolRegistry = remember { 
+        buildToolRegistry(
+            connectionManager = connectionManager,
+            onTopicSwitch = { summary ->
+                messages = emptyList()
+                if (summary != null && currentThreadId != null) {
+                    val updatedThreads = threads.map { 
+                        if (it.id == currentThreadId) it.copy(summary = summary) else it 
+                    }
+                    onThreadsChange(updatedThreads)
+                }
+            },
+            onEndConversation = {
+                val oldId = currentThreadId
+                if (oldId != null) {
+                    val summary = threads.find { it.id == oldId }?.summary ?: "New Thread"
+                    syncQueue.enqueue(oldId, messages, summary, isClosed = true)
+                    coroutineScope.launch { syncQueue.flush() }
+                }
+                messages = emptyList()
+                onCurrentThreadIdChange(null)
+                if (oldId != null) {
+                    onThreadsChange(threads.filter { it.id != oldId })
+                }
+            }
+        ) 
     }
     
     // Toggle to use Mock LLM instead of Gemini based on ENV
@@ -772,9 +797,6 @@ fun ChatScreen(
     
     val isGenerating by if (useMockLlm) mockLlm.isGenerating.collectAsState() else geminiLlm.isGenerating.collectAsState()
     
-    val coroutineScope = rememberCoroutineScope()
-    
-    var messages by remember { mutableStateOf(listOf<ChatMessage>()) }
     var input by remember { mutableStateOf("") }
     var replyToMessage by remember { mutableStateOf<ChatMessage?>(null) }
     var isVoiceActive by remember { mutableStateOf(false) }
@@ -963,6 +985,9 @@ fun ChatScreen(
                 }
             }
             storage.setString("thread_msgs_$currentThreadId", arr.toString())
+            
+            val summary = threads.find { it.id == currentThreadId }?.summary ?: "New Thread"
+            syncQueue.enqueue(currentThreadId, messages, summary)
         }
     }
 

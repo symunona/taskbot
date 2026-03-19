@@ -17,6 +17,10 @@ class ConnectionManager {
     private val maxRetries = 5
     private var connectJob: kotlinx.coroutines.Job? = null
     
+    fun isConnected(): Boolean {
+        return webSocketClient.connectionState.value == WebSocketClient.ConnectionState.Connected
+    }
+    
     // Parses: hermes://<pubkey_base64>/<token>?addrs=<ip>:<port>&addrs=<domain>:443
     fun connectFromString(connectionString: String, clientToken: String? = null) {
         try {
