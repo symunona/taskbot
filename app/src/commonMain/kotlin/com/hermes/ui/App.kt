@@ -58,7 +58,8 @@ data class ChatMessage(
     val content: String,
     val isToolResult: Boolean = false,
     val isVoiceTranscript: Boolean = false,
-    val isVoicePartial: Boolean = false
+    val isVoicePartial: Boolean = false,
+    val agentContext: String? = null
 )
 data class ThreadInfo(val id: String, val summary: String)
 
@@ -481,7 +482,7 @@ fun MainAppScreen(
                         "+ New",
                         color = MaterialTheme.colors.primary,
                         modifier = Modifier.clickable {
-                            currentThreadId = null
+                            newThreadEvent.tryEmit(Unit)
                             currentScreen = AppScreen.CHAT
                             coroutineScope.launch { scaffoldState.drawerState.close() }
                         }.padding(4.dp)
@@ -826,6 +827,11 @@ fun ChatScreen(
         voiceSession?.stop()
         voiceSession = null
         isVoiceActive = false
+        messages = messages + ChatMessage(
+            role = "system",
+            content = "Voice conversation ended.",
+            isToolResult = false
+        )
     }
 
     suspend fun ensureThreadExists(): String {
@@ -1037,28 +1043,54 @@ fun ChatScreen(
                 }
             } else {
                 items(messages) { msg ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = if (msg.role == "user") Arrangement.End else Arrangement.Start
-                    ) {
-                        val bubbleColor = when {
-                            msg.role == "user" && msg.isVoiceTranscript -> Color(0xFF1565C0)
-                            msg.role == "model" && msg.isVoiceTranscript -> Color(0xFF2E7D32)
-                            msg.role == "user" -> Color(0xFF0056B3)
-                            msg.isToolResult -> Color(0xFF444444)
-                            else -> Color(0xFF333333)
-                        }
-                        Box(
-                            modifier = Modifier
-                                .background(
-                                    color = bubbleColor,
-                                    shape = MaterialTheme.shapes.medium
-                                )
-                                .clickable { replyToMessage = msg }
-                                .padding(10.dp)
-                                .fillMaxWidth(0.8f)
+                    if (msg.role == "system") {
+                        var expanded by remember { mutableStateOf(false) }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.Center
                         ) {
-                            Text(msg.content, color = Color.White)
+                            Box(
+                                modifier = Modifier
+                                    .background(
+                                        color = Color(0xFF555555),
+                                        shape = MaterialTheme.shapes.small
+                                    )
+                                    .clickable { if (msg.agentContext != null) expanded = !expanded }
+                                    .padding(8.dp)
+                            ) {
+                                Column {
+                                    Text(msg.content, color = Color.LightGray, style = MaterialTheme.typography.caption)
+                                    if (expanded && msg.agentContext != null) {
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(msg.agentContext, color = Color.White, style = MaterialTheme.typography.caption)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = if (msg.role == "user") Arrangement.End else Arrangement.Start
+                        ) {
+                            val bubbleColor = when {
+                                msg.role == "user" && msg.isVoiceTranscript -> Color(0xFF1565C0)
+                                msg.role == "model" && msg.isVoiceTranscript -> Color(0xFF2E7D32)
+                                msg.role == "user" -> Color(0xFF0056B3)
+                                msg.isToolResult -> Color(0xFF444444)
+                                else -> Color(0xFF333333)
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .background(
+                                        color = bubbleColor,
+                                        shape = MaterialTheme.shapes.medium
+                                    )
+                                    .clickable { replyToMessage = msg }
+                                    .padding(10.dp)
+                                    .fillMaxWidth(0.8f)
+                            ) {
+                                Text(msg.content, color = Color.White)
+                            }
                         }
                     }
                 }
@@ -1185,6 +1217,13 @@ fun ChatScreen(
 
                             isVoiceConnecting = true
                             try {
+                                val contextStr = "System Instruction:\n$personaContext\n\nTools:\n${toolsArray.toString()}"
+                                messages = messages + ChatMessage(
+                                    role = "system",
+                                    content = "Voice conversation started. Tap to view context.",
+                                    isToolResult = false,
+                                    agentContext = contextStr
+                                )
                                 session.start()
                                 isVoiceConnecting = false
                             } catch (e: Throwable) {
