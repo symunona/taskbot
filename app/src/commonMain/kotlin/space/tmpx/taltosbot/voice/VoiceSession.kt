@@ -6,12 +6,22 @@ import space.tmpx.taltosbot.ui.LogLevel
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
@@ -69,6 +79,12 @@ class VoiceSession(
         capacity = 50,
         onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
     )
+
+    // Live `toolCallCancellation`: the user talked over a turn, its calls must not run or answer.
+    private val toolLock = Mutex()
+    private val runningCalls = mutableMapOf<String, Deferred<JsonObject>>()
+    /** Cancelled before the call got to run. */
+    private val cancelledCalls = mutableSetOf<String>()
 
     private val _transcripts = MutableSharedFlow<VoiceTranscript>(extraBufferCapacity = 64)
     val transcripts: SharedFlow<VoiceTranscript> = _transcripts
@@ -130,9 +146,13 @@ class VoiceSession(
     }
 
     @OptIn(ExperimentalEncodingApi::class)
-    private fun handleIncomingMessage(message: JsonObject) {
+    private suspend fun handleIncomingMessage(message: JsonObject) {
         val serverContent = message["serverContent"]?.jsonObject
         val toolCall = message["toolCall"]?.jsonObject
+        message["usageMetadata"]?.let { EventLogger.log("GeminiLive: usage $it", level = LogLevel.DEBUG) }
+        (message["toolCallCancellation"] as? JsonObject)?.get("ids")?.jsonArray
+            ?.mapNotNull { it.jsonPrimitive.contentOrNull }
+            ?.let { cancelToolCalls(it) }
         parseCallUsage(message["usageMetadata"] as? JsonObject)?.let {
             tokensIn += it.input
             tokensOut += it.output
@@ -187,7 +207,11 @@ class VoiceSession(
                         val callId = functionCall["id"]?.jsonPrimitive?.contentOrNull ?: return@forEach
                         val args = functionCall["args"]?.jsonObject ?: buildJsonObject {}
                         EventLogger.log("VoiceSession: tool call $name")
-                        val result = executeTool(name, args)
+                        val result = runCancellable(callId) { executeTool(name, args) }
+                        if (result == null) {
+                            EventLogger.log("VoiceSession: tool call $name cancelled, no response sent")
+                            return@forEach
+                        }
                         add(buildJsonObject {
                             put("id", callId)
                             put("name", name)
@@ -200,6 +224,32 @@ class VoiceSession(
                     client.sendToolResponse(responses)
                 }
             }
+        }
+    }
+
+    /** Runs one tool call. Null = Gemini cancelled it: no response is owed. */
+    private suspend fun runCancellable(callId: String, block: suspend () -> JsonObject): JsonObject? = coroutineScope {
+        val call = async(start = CoroutineStart.LAZY) { block() }
+        val skip = toolLock.withLock {
+            cancelledCalls.remove(callId) || run { runningCalls[callId] = call; false }
+        }
+        if (skip) {
+            call.cancel()
+            return@coroutineScope null
+        }
+        try {
+            call.await()
+        } catch (e: CancellationException) {
+            ensureActive() // the session itself is going down: not a tool cancel
+            null
+        } finally {
+            withContext(NonCancellable) { toolLock.withLock { runningCalls.remove(callId) } }
+        }
+    }
+
+    private suspend fun cancelToolCalls(ids: List<String>) {
+        toolLock.withLock {
+            ids.forEach { id -> runningCalls[id]?.cancel() ?: cancelledCalls.add(id) }
         }
     }
 

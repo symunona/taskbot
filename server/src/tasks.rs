@@ -393,9 +393,14 @@ impl Tasks {
     }
 }
 
-/// Tell every socket about changed tasks.
-pub fn push(app: &App, changed: Vec<Task>) {
+/// Tell every socket about changed tasks. A finished task in `changed` has
+/// just finished (final states never change again): it gets its line in the
+/// project file here.
+pub fn push(app: &Arc<App>, changed: Vec<Task>) {
     for task in changed {
+        if task.state.finished() {
+            crate::memory::log_task(app, &task);
+        }
         app.push("tasks.changed", json!({ "task": task }));
     }
 }

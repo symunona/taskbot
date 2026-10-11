@@ -1,5 +1,6 @@
 package space.tmpx.taltosbot.connection
 
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -8,8 +9,8 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 
-/** `Thread` of docs/protocol.md "Threads". Times = epoch ms. */
-data class ThreadInfo(val id: String, val name: String, val createdAt: Long, val lastAccessedAt: Long)
+/** `Thread` of docs/protocol.md "Threads". Times = epoch ms. [project] = active project, null = none. */
+data class ThreadInfo(val id: String, val name: String, val createdAt: Long, val lastAccessedAt: Long, val project: String? = null)
 
 /** `Entry.tool`. No [result] = still running (or the app died before the result came). */
 data class ToolCall(
@@ -51,7 +52,7 @@ internal fun JsonObject.bool(key: String): Boolean = (this[key] as? JsonPrimitiv
 internal fun parseThread(obj: JsonObject?): ThreadInfo? {
     val id = obj?.str("id")?.takeIf { it.isNotBlank() } ?: return null
     val created = obj.long("created_at") ?: 0L
-    return ThreadInfo(id, obj.str("name") ?: "", created, obj.long("last_accessed_at") ?: created)
+    return ThreadInfo(id, obj.str("name") ?: "", created, obj.long("last_accessed_at") ?: created, obj.str("project")?.takeIf { it.isNotBlank() })
 }
 
 internal fun parseEntry(obj: JsonObject): Entry? {
@@ -102,8 +103,45 @@ data class ThreadMemory(val text: String, val uptoId: String, val at: Long)
 /** `Usage`: token counts of a thread, all time. */
 data class TokenUse(val input: Long = 0, val output: Long = 0)
 
+/** `Pin` of docs/protocol.md "Pins": one line fixed by tool. */
+data class Pin(val text: String, val at: Long)
+
+/** `Pins`: one scope (`always` or a thread). [size], [limit] = chars; [limit] 0 = server sent none. */
+data class Pins(val pins: List<Pin> = emptyList(), val size: Int = 0, val limit: Int = 0)
+
+/** `ProjectMemory`: the `.taskbot.md` of [project], cut to [limit] by the server. [size] = the whole file. */
+data class ProjectMemory(val project: String, val text: String, val size: Int, val limit: Int)
+
 /** `threads.get` reply. Destructures like the old `(thread, entries)` pair. */
-data class LoadedThread(val thread: ThreadInfo, val entries: List<Entry>, val memory: ThreadMemory?, val usage: TokenUse)
+data class LoadedThread(
+    val thread: ThreadInfo,
+    val entries: List<Entry>,
+    val memory: ThreadMemory?,
+    val usage: TokenUse,
+    val pins: Pins = Pins(),
+    val always: Pins = Pins(),
+    val projectMemory: ProjectMemory? = null
+)
+
+/** `threads.create` reply. [always] null = the server sent none (older server). */
+data class CreatedThread(val thread: ThreadInfo, val always: Pins?)
+
+/** `threads.compact` reply. Destructures like the old `(memory, usage)` pair. */
+data class Compacted(val memory: ThreadMemory?, val usage: TokenUse, val pins: Pins = Pins())
+
+/** Absent (older server) → empty scope. */
+internal fun parsePins(obj: JsonObject?): Pins {
+    val pins = (obj?.get("pins") as? JsonArray).orEmpty().mapNotNull { pin ->
+        (pin as? JsonObject)?.let { p -> p.str("text")?.takeIf { it.isNotBlank() }?.let { Pin(it, p.long("at") ?: 0L) } }
+    }
+    return Pins(pins, obj?.long("size")?.toInt() ?: pins.sumOf { it.text.length + 1 }, obj?.long("limit")?.toInt() ?: 0)
+}
+
+internal fun parseProjectMemory(obj: JsonObject?): ProjectMemory? {
+    val project = obj?.str("project")?.takeIf { it.isNotBlank() } ?: return null
+    val text = obj.str("text") ?: ""
+    return ProjectMemory(project, text, obj.long("size")?.toInt() ?: text.length, obj.long("limit")?.toInt() ?: 0)
+}
 
 internal fun parseMemory(obj: JsonObject?): ThreadMemory? {
     val text = obj?.str("text")?.takeIf { it.isNotBlank() } ?: return null

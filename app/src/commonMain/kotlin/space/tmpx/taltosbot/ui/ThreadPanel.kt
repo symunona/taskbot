@@ -16,6 +16,7 @@ import androidx.compose.material.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -26,6 +27,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import space.tmpx.taltosbot.connection.ConnState
 import space.tmpx.taltosbot.connection.EntryKind
+import space.tmpx.taltosbot.llm.MEMORY_WARN_PERCENT
+import space.tmpx.taltosbot.llm.memoryFullPercent
 import kotlinx.datetime.Clock
 
 /** "950", "3.1k", "212k", "1.4M". */
@@ -38,12 +41,18 @@ internal fun tokenCount(n: Long): String = when {
 
 /**
  * Right-side drawer over the whole screen, about the thread on screen: metadata, token use, and
- * on its second page ("Long CTX") the thread memory the model works from, with the COMPACT button.
+ * on its second page ("Long CTX") the pins and the thread memory the model works from, with the
+ * COMPACT button.
  */
 @Composable
 fun BoxScope.ThreadPanel(controller: AppController, open: Boolean, onClose: () -> Unit) {
     // A `threads.memory` push may have been missed while offline.
-    LaunchedEffect(open) { if (open) controller.refreshMemory() }
+    LaunchedEffect(open) {
+        if (open) {
+            controller.refreshMemory()
+            controller.refreshProjects()
+        }
+    }
     val now = remember(open, controller.memory, controller.currentThread) { Clock.System.now().toEpochMilliseconds() }
     var longCtx by remember(open) { mutableStateOf(false) }
 
@@ -88,6 +97,10 @@ private fun ColumnScope.ThreadPage(controller: AppController, now: Long, onLongC
         InfoRow("created", relativeTime(thread.createdAt, now))
         InfoRow("last used", relativeTime(thread.lastAccessedAt, now))
         InfoRow("entries", controller.entries.count { it.kind != EntryKind.MARKER && it.kind != EntryKind.SYSTEM }.toString())
+        ProjectRow(controller, thread.project)
+        controller.projectError?.let {
+            Text(it, color = Color(0xFFFF8A80), style = MaterialTheme.typography.caption)
+        }
 
         Spacer(modifier = Modifier.height(16.dp))
         Text("Tokens", color = Color.Gray, style = MaterialTheme.typography.caption)
@@ -125,7 +138,23 @@ private fun ColumnScope.LongCtxPage(controller: AppController, now: Long) {
         style = MaterialTheme.typography.caption,
         modifier = Modifier.padding(horizontal = 16.dp)
     )
-    Box(modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).verticalScroll(rememberScrollState())) {
+    Column(modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).verticalScroll(rememberScrollState())) {
+        // Pins and project memory ride in every prompt, compacted or not.
+        val always = controller.always
+        PinnedSection("Always", always.size, always.limit, always.pins.joinToString("\n") { it.text }, "No notes for every conversation.")
+        val project = controller.currentThread?.project
+        val projectMemory = controller.projectMemory
+        PinnedSection(
+            if (project == null) "Project" else "Project: $project",
+            projectMemory?.size ?: 0,
+            projectMemory?.limit ?: 0,
+            projectMemory?.text?.trimEnd() ?: "",
+            if (project == null) "No active project." else "No .taskbot.md in this project yet."
+        )
+        val pins = controller.pins
+        PinnedSection("Pinned", pins.size, pins.limit, pins.pins.joinToString("\n") { it.text }, "Nothing pinned in this thread.")
+
+        Text("Memory", color = Color.Gray, style = MaterialTheme.typography.caption)
         val memory = controller.memory
         if (memory == null) {
             Text("The model still gets the conversation itself. Compact folds it into a short memory.", color = Color.Gray)
@@ -148,6 +177,58 @@ private fun ColumnScope.LongCtxPage(controller: AppController, now: Long) {
             Spacer(modifier = Modifier.width(8.dp))
         }
         Text("COMPACT")
+    }
+}
+
+/**
+ * One pin scope as the model gets it, read-only, under a `size / limit` meter: amber from the
+ * warn mark, red when full or cut (docs/protocol.md "Pins").
+ */
+@Composable
+private fun PinnedSection(title: String, size: Int, limit: Int, text: String, empty: String) {
+    Row(modifier = Modifier.fillMaxWidth()) {
+        Text(title, color = Color.Gray, style = MaterialTheme.typography.caption, modifier = Modifier.weight(1f))
+        if (limit > 0) {
+            val percent = memoryFullPercent(size, limit)
+            val color = when {
+                percent >= 100 -> Color(0xFFFF8A80)
+                percent >= MEMORY_WARN_PERCENT -> Color(0xFFFFC107)
+                else -> Color.Gray
+            }
+            Text("$size / $limit", color = color, style = MaterialTheme.typography.caption)
+        }
+    }
+    if (text.isBlank()) {
+        Text(empty, color = Color.Gray, style = MaterialTheme.typography.body2)
+    } else {
+        SelectionContainer {
+            Text(text, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.body2)
+        }
+    }
+    Spacer(modifier = Modifier.height(12.dp))
+}
+
+/** Active project of the thread, with a picker: every known project + "none". */
+@Composable
+private fun ProjectRow(controller: AppController, project: String?) {
+    var open by remember { mutableStateOf(false) }
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text("project", color = Color.Gray, modifier = Modifier.width(104.dp))
+        Box {
+            Row(modifier = Modifier.clickable { open = true }, verticalAlignment = Alignment.CenterVertically) {
+                Text(project ?: "none", color = if (project == null) Color.Gray else Color.Unspecified)
+                Icon(Icons.Filled.ArrowDropDown, contentDescription = "Pick project", modifier = Modifier.size(18.dp))
+            }
+            DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                // The active one stays pickable even when the list did not load.
+                for (name in listOf("") + (controller.projects + listOfNotNull(project)).distinct()) {
+                    DropdownMenuItem(onClick = {
+                        open = false
+                        controller.setProject(name)
+                    }) { Text(name.ifEmpty { "none" }) }
+                }
+            }
+        }
     }
 }
 

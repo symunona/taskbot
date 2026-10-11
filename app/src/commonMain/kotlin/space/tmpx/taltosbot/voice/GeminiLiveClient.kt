@@ -53,6 +53,16 @@ class GeminiLiveClient(
         }
     }
 
+    /**
+     * Live models after 2.x run function calls `NON_BLOCKING` unless told otherwise: the model
+     * talks on before the result is in. The app answers each call once, in order, so it pins
+     * `BLOCKING`. 2.x already blocks and is sent the declarations untouched.
+     */
+    private val asyncToolsByDefault = "gemini-2" !in modelName
+
+    private fun blocking(declaration: kotlinx.serialization.json.JsonElement) =
+        (declaration as? JsonObject)?.let { JsonObject(it + ("behavior" to JsonPrimitive("BLOCKING"))) } ?: declaration
+
     private var session: DefaultClientWebSocketSession? = null
     private var receiveJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -183,7 +193,7 @@ class GeminiLiveClient(
                 if (tools != null && tools.isNotEmpty()) {
                     put("tools", buildJsonArray {
                         add(buildJsonObject {
-                            put("functionDeclarations", tools)
+                            put("functionDeclarations", if (asyncToolsByDefault) JsonArray(tools.map(::blocking)) else tools)
                         })
                     })
                 }

@@ -45,6 +45,29 @@ pub struct Thread {
     pub name: String,
     pub created_at: i64,
     pub last_accessed_at: i64,
+    /// Active project, a name from `[projects.*]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+/// A pinned note. `seq` = list order, never leaves the server.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Pin {
+    #[serde(skip)]
+    pub seq: i64,
+    pub text: String,
+    /// Epoch ms of the write or last replace.
+    pub at: i64,
+}
+
+/// A thread as `memory_read` lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Remembered {
+    pub thread: Thread,
+    /// How many pins the thread holds.
+    pub pins: i64,
+    /// The thread has a memory text.
+    pub memory: bool,
 }
 
 /// Thread memory: where the thread stands, made by a compact.
@@ -179,7 +202,13 @@ impl Store {
                 kind TEXT NOT NULL,
                 body TEXT NOT NULL,
                 PRIMARY KEY(thread_id, seq),
-                UNIQUE(thread_id, id));",
+                UNIQUE(thread_id, id));
+             CREATE TABLE IF NOT EXISTS pins(
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT,
+                text TEXT NOT NULL,
+                at INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS pins_thread ON pins(thread_id);",
         )?;
         add_missing_columns(
             &conn,
@@ -190,6 +219,7 @@ impl Store {
                 ("summary_at", "INTEGER NOT NULL DEFAULT 0"),
                 ("tokens_in", "INTEGER NOT NULL DEFAULT 0"),
                 ("tokens_out", "INTEGER NOT NULL DEFAULT 0"),
+                ("project", "TEXT"),
             ],
         )?;
         Ok(Self {
@@ -306,7 +336,7 @@ impl Store {
     pub fn threads(&self) -> Res<Vec<Thread>> {
         let conn = self.conn();
         let mut st = conn.prepare(
-            "SELECT id, name, created_at, last_accessed_at FROM threads
+            "SELECT id, name, created_at, last_accessed_at, project FROM threads
              ORDER BY last_accessed_at DESC, rowid DESC",
         )?;
         let rows = st.query_map([], row_thread)?.collect();
@@ -320,6 +350,7 @@ impl Store {
             name: name.to_string(),
             created_at: now_ms,
             last_accessed_at: now_ms,
+            project: None,
         };
         self.conn().execute(
             "INSERT INTO threads(id, name, created_at, last_accessed_at) VALUES (?1, ?2, ?3, ?3)",
@@ -369,6 +400,106 @@ impl Store {
             return Ok(None);
         }
         select_thread(&conn, id).map(Some)
+    }
+
+    /// A thread, `last_accessed_at` left alone. `None` = unknown id.
+    pub fn thread_info(&self, id: &str) -> Res<Option<Thread>> {
+        select_thread(&self.conn(), id).optional()
+    }
+
+    /// Set (`Some`) or clear (`None`) the active project. `None` = unknown id.
+    pub fn set_thread_project(&self, id: &str, project: Option<&str>) -> Res<Option<Thread>> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "UPDATE threads SET project = ?2 WHERE id = ?1",
+            params![id, project],
+        )?;
+        if n != 1 {
+            return Ok(None);
+        }
+        select_thread(&conn, id).map(Some)
+    }
+
+    /// Make `project` the active one if the thread has none. `None` = the
+    /// thread has one already, or is unknown: nothing changed.
+    pub fn adopt_thread_project(&self, id: &str, project: &str) -> Res<Option<Thread>> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "UPDATE threads SET project = ?2 WHERE id = ?1 AND project IS NULL",
+            params![id, project],
+        )?;
+        if n != 1 {
+            return Ok(None);
+        }
+        select_thread(&conn, id).map(Some)
+    }
+
+    /// Pins of a thread, or the `always` pins (`None`), in insert order.
+    pub fn pins(&self, thread: Option<&str>) -> Res<Vec<Pin>> {
+        let conn = self.conn();
+        let mut st =
+            conn.prepare("SELECT seq, text, at FROM pins WHERE thread_id IS ?1 ORDER BY seq")?;
+        let rows = st
+            .query_map(params![thread], |r| {
+                Ok(Pin {
+                    seq: r.get(0)?,
+                    text: r.get(1)?,
+                    at: r.get(2)?,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    /// `thread` = `None`: an `always` pin.
+    pub fn add_pin(&self, thread: Option<&str>, text: &str, now_ms: i64) -> Res<()> {
+        self.conn().execute(
+            "INSERT INTO pins(thread_id, text, at) VALUES (?1, ?2, ?3)",
+            params![thread, text, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Swap the text of a pin; it keeps its place in the list.
+    pub fn set_pin(&self, seq: i64, text: &str, now_ms: i64) -> Res<()> {
+        self.conn().execute(
+            "UPDATE pins SET text = ?2, at = ?3 WHERE seq = ?1",
+            params![seq, text, now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_pin(&self, seq: i64) -> Res<()> {
+        self.conn()
+            .execute("DELETE FROM pins WHERE seq = ?1", params![seq])?;
+        Ok(())
+    }
+
+    /// Threads that hold pins or a memory, most recently accessed first.
+    /// `skip` = a thread id to leave out.
+    pub fn remembered(&self, skip: Option<&str>, max: usize) -> Res<Vec<Remembered>> {
+        let conn = self.conn();
+        let mut st = conn.prepare(
+            "SELECT t.id, t.name, t.created_at, t.last_accessed_at, t.project,
+                    (SELECT COUNT(*) FROM pins p WHERE p.thread_id = t.id),
+                    t.summary IS NOT NULL
+             FROM threads t
+             WHERE t.id IS NOT ?1
+               AND (t.summary IS NOT NULL
+                    OR EXISTS (SELECT 1 FROM pins p WHERE p.thread_id = t.id))
+             ORDER BY t.last_accessed_at DESC, t.rowid DESC
+             LIMIT ?2",
+        )?;
+        let rows = st
+            .query_map(params![skip, max as i64], |r| {
+                Ok(Remembered {
+                    thread: row_thread(r)?,
+                    pins: r.get(5)?,
+                    memory: r.get(6)?,
+                })
+            })?
+            .collect();
+        rows
     }
 
     /// Upsert entries by their `id`, touching `last_accessed_at`. A new id takes
@@ -537,7 +668,7 @@ fn touch_thread(conn: &Connection, id: &str, now_ms: i64) -> Res<bool> {
 
 fn select_thread(conn: &Connection, id: &str) -> Res<Thread> {
     conn.query_row(
-        "SELECT id, name, created_at, last_accessed_at FROM threads WHERE id = ?1",
+        "SELECT id, name, created_at, last_accessed_at, project FROM threads WHERE id = ?1",
         params![id],
         row_thread,
     )
@@ -549,6 +680,7 @@ fn row_thread(r: &rusqlite::Row<'_>) -> Res<Thread> {
         name: r.get(1)?,
         created_at: r.get(2)?,
         last_accessed_at: r.get(3)?,
+        project: r.get(4)?,
     })
 }
 
@@ -775,6 +907,99 @@ mod tests {
                 Some((None, Usage::default()))
             );
         }
+    }
+
+    #[test]
+    fn old_db_gains_pins_and_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE threads(id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, last_accessed_at INTEGER NOT NULL);
+                 INSERT INTO threads VALUES ('old', 'Old', 1, 1);",
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let s = Store::open(&path).unwrap();
+            assert!(s.pins(Some("old")).unwrap().is_empty());
+            assert!(s.pins(None).unwrap().is_empty());
+            assert_eq!(s.thread_info("old").unwrap().unwrap().project, None);
+        }
+    }
+
+    #[test]
+    fn pins_per_scope_keep_their_order() {
+        let (_d, s) = store();
+        let t = s.create_thread("T", 1000).unwrap();
+        let other = s.create_thread("O", 1000).unwrap();
+        s.add_pin(Some(&t.id), "a", 1).unwrap();
+        s.add_pin(None, "everywhere", 2).unwrap();
+        s.add_pin(Some(&t.id), "b", 3).unwrap();
+        s.add_pin(Some(&t.id), "c", 4).unwrap();
+        let texts = |pins: Vec<Pin>| pins.into_iter().map(|p| p.text).collect::<Vec<_>>();
+        assert_eq!(texts(s.pins(Some(&t.id)).unwrap()), ["a", "b", "c"]);
+        assert_eq!(texts(s.pins(None).unwrap()), ["everywhere"]);
+        assert!(s.pins(Some(&other.id)).unwrap().is_empty());
+
+        // A swap keeps the slot and takes the new time; a delete closes the gap.
+        let pins = s.pins(Some(&t.id)).unwrap();
+        s.set_pin(pins[1].seq, "B", 9).unwrap();
+        s.delete_pin(pins[0].seq).unwrap();
+        let pins = s.pins(Some(&t.id)).unwrap();
+        assert_eq!((pins[0].text.as_str(), pins[0].at), ("B", 9));
+        assert_eq!(texts(pins), ["B", "c"]);
+        assert_eq!(
+            serde_json::to_value(&s.pins(None).unwrap()[0]).unwrap(),
+            serde_json::json!({"text": "everywhere", "at": 2}),
+            "seq stays inside"
+        );
+
+        // Listed: threads with pins or a memory, the asking one left out.
+        let empty = s.create_thread("E", 1000).unwrap();
+        s.append_entries(&other.id, &[entry("e1", 1, "x")], 2000)
+            .unwrap();
+        s.store_memory(&other.id, 0, 1, "- m", 3000, Usage::default())
+            .unwrap();
+        let listed = s.remembered(None, 50).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|r| r.thread.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [other.id.as_str(), t.id.as_str()],
+            "newest access first"
+        );
+        assert!(!ids.contains(&empty.id.as_str()));
+        assert_eq!((listed[0].pins, listed[0].memory), (0, true));
+        assert_eq!((listed[1].pins, listed[1].memory), (2, false));
+        assert_eq!(s.remembered(Some(&t.id), 50).unwrap().len(), 1);
+        assert_eq!(s.remembered(None, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn active_project_set_clear_adopt() {
+        let (_d, s) = store();
+        let t = s.create_thread("T", 1000).unwrap();
+        assert_eq!(
+            serde_json::to_value(&t).unwrap().as_object().unwrap().len(),
+            4,
+            "no project: field absent"
+        );
+        let adopted = s.adopt_thread_project(&t.id, "garden").unwrap().unwrap();
+        assert_eq!(adopted.project.as_deref(), Some("garden"));
+        assert!(
+            s.adopt_thread_project(&t.id, "other").unwrap().is_none(),
+            "has one: no change"
+        );
+        let set = s.set_thread_project(&t.id, Some("other")).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&set).unwrap()["project"], "other");
+        assert_eq!(s.threads().unwrap()[0].project.as_deref(), Some("other"));
+        let cleared = s.set_thread_project(&t.id, None).unwrap().unwrap();
+        assert_eq!(cleared.project, None);
+        assert_eq!(cleared.last_accessed_at, 1000, "not an access");
+        assert!(s.set_thread_project("nope", None).unwrap().is_none());
+        assert!(s.adopt_thread_project("nope", "x").unwrap().is_none());
+        assert!(s.thread_info("nope").unwrap().is_none());
     }
 
     #[test]

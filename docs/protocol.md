@@ -73,11 +73,12 @@ Envelope after auth: `{"event", "id", "ref_id"?, "ts", "payload"}`. Reply carrie
 | `sessions.list` | `{}` | `sessions.list.result` | `{sessions:[Session]}` |
 | `tasks.list` | `{}` | `tasks.list.result` | `{tasks:[Task]}`, newest first. Initial sync, again after every reconnect. |
 | `threads.list` | `{}` | `threads.list.result` | `{threads:[Thread]}`, newest `last_accessed_at` first |
-| `threads.create` | `{name?}` | `threads.create.result` | `{thread:Thread}` |
-| `threads.get` | `{id}` | `threads.get.result` | `{thread:Thread, entries:[Entry], memory?:Memory, usage:Usage}`, `seq` order. Touches `last_accessed_at`. |
+| `threads.create` | `{name?}` | `threads.create.result` | `{thread:Thread, always:Pins}` |
+| `threads.get` | `{id}` | `threads.get.result` | `{thread:Thread, entries:[Entry], memory?:Memory, usage:Usage, pins:Pins, always:Pins, project_memory?:ProjectMemory}`, `seq` order. Touches `last_accessed_at`. |
 | `threads.rename` | `{id, name}` | `threads.rename.result` | `{thread:Thread}` |
 | `threads.append` | `{id, entries:[Entry]}` | `threads.append.result` | `{count}`. Upsert by entry `id`. Touches `last_accessed_at`. |
-| `threads.compact` | `{id}` | `threads.compact.result` | `{memory?:Memory, usage:Usage}`. Waits for the compact. Nothing to fold → current memory. Failure → `error`. |
+| `threads.set_project` | `{id, project}` | `threads.set_project.result` | `{thread:Thread}`. Sets the active project. `""` = none. Unknown project → `error`. |
+| `threads.compact` | `{id}` | `threads.compact.result` | `{memory?:Memory, usage:Usage, pins:Pins}`. Waits for the compact. Nothing to fold → current memory. Failure → `error`. |
 | `threads.usage` | `{id, input, output}` | `threads.usage.result` | `{usage:Usage}`. Adds token counts (integers ≥ 0) to the thread. |
 | any | | `error` | `{error:"..."}` |
 
@@ -92,8 +93,10 @@ Server push, no `ref_id`:
 | `agent.say` | `{project, text}` | live voice: inject as text turn so Gemini speaks it. Else: chat bubble. |
 | `agent.event` | `{project, kind, detail}` | log. Later: earcons. `kind` = `spawned`, `prompt`, `start`, `activity`, `waiting`, `resume`, `stop`, `error`. |
 | `tasks.changed` | `{task:Task}` | upsert by `task.id`, redraw. UI only: never injected into the voice model. |
-| `threads.changed` | `{thread:Thread}` | update thread list + title. Sent on create, rename. |
-| `threads.memory` | `{thread_id, memory:Memory, usage:Usage}` | swap the memory of that thread. Sent after every compact that stored one. |
+| `threads.changed` | `{thread:Thread}` | update thread list + title. Sent on create, rename, active project change. |
+| `threads.memory` | `{thread_id, memory?:Memory, pins:Pins, usage:Usage}` | swap memory and pins of that thread. `memory` absent = never compacted. Sent after every compact that stored one, and after every thread pin change. |
+| `memory.always` | `Pins` | swap the `always` pins, all threads. Sent after every `always` pin change. |
+| `memory.project` | `ProjectMemory` | swap the memory of that project. Sent after every server write to its `.taskbot.md`. |
 
 `Session` = `{project, tmux, status, claude_session_id, url}`. `status` = `idle` / `busy` / `waiting` / `dead`. `waiting` = stuck on a permission prompt, answer it in the Claude app. `url` = `https://claude.ai/code/<bridgeSessionId>` or null.
 
@@ -157,7 +160,7 @@ Shim → server, how a task moves (`tasks` = ids of the tasks in the turn):
 
 One thread = one conversation, voice and text mixed. Stored in the server sqlite, shared by all paired devices.
 
-`Thread` = `{id, name, created_at, last_accessed_at}`. Times = epoch ms. `id` = 16 hex. `name`: control chars dropped, trimmed, cut to 80 chars; empty after that → `error`. `threads.create` without `name` → `New thread`.
+`Thread` = `{id, name, created_at, last_accessed_at, project?}`. `project` = active project, a name from `[projects.*]`; absent = none. Times = epoch ms. `id` = 16 hex. `name`: control chars dropped, trimmed, cut to 80 chars; empty after that → `error`. `threads.create` without `name` → `New thread`.
 
 `Entry` = `{id, ts, kind, text, voice?, project?, error?, tool?}`.
 
@@ -186,6 +189,9 @@ App rules:
 - No memory, or `upto_id` not among the loaded entries: plain tail window of the entries.
 - Token use: after each text turn and at voice stop, send `threads.usage` with the `usageMetadata` sums (`input` = prompt tokens, `output` = the rest).
 - Voice start / stop: append `marker` entry.
+- Voice session: one Live connection, no session resumption. App stops it at 9 min (Gemini cuts at ~10) with a plain note; `goAway` or a lost socket ends it with an error note. Restart = mic button, context rebuilt as at any voice start.
+- Live `toolCallCancellation {ids}`: app cancels those calls and sends no response for them. Entry result: `{error:"cancelled"}`. A `tool.call` already at the server is not recalled.
+- Live models after 2.x: function declarations get `behavior: "BLOCKING"` (their default is `NON_BLOCKING`).
 - `tool.call` from the app always carries the current `thread_id`.
 
 ### Thread memory
@@ -205,6 +211,71 @@ Where the thread stands now. Not a history. Derived from the entries, made by th
 
 - Info questions: `Recent` only, never `State`. Chit-chat: nowhere. Tool result bodies: nowhere.
 
+### Pins
+
+Short lines fixed by the user or the model, by tool. Not made by the compact, never changed by it.
+
+`Pin` = `{text, at}`. `at` = epoch ms of the write or last replace. Scope `project`: the file holds no time per line, `at` = last write of the file.
+
+`Pins` = `{pins:[Pin], size, limit}`. Insert order. `size` = chars of the scope as it goes into the prompt (sum of pin texts + 1 per pin). `limit` = upper limit of the scope, chars.
+
+| scope | holds | stored | in the prompt | limit |
+|---|---|---|---|---|
+| `always` | rules and facts for every conversation | server sqlite | every thread | 1200 |
+| `project` | rules and facts of a project, task log | `<project dir>/.taskbot.md`, see "Project memory" | threads whose active project it is | 3000 |
+| `thread` | standing rules of the thread, things the user said to remember | server sqlite | its own thread | 1500 |
+
+- No cap on the number of pins.
+- One pin = one line: control chars dropped, newlines → space, trimmed, cut to 300 chars. Empty after that → `{error}`.
+- Who wins: `thread` pin beats `project` pin beats `always` pin beats `## State`.
+- Warn mark = 80% of `limit`. Write that leaves `size` at or over it: stored, tool result carries `warning`.
+- Write that would leave `size` over `limit`: `{error:"<scope> memory full", size, limit, pins}`, nothing stored. A `replaces` that does not grow the scope always works.
+- Compact: gets `always` pins + project `## Pinned` + thread pins as read-only input. Never repeats one in `## State`; drops a `## State` bullet a pin contradicts.
+
+App rules:
+
+- Prompt block order: base prompt, `always`, project memory, thread pins, thread memory, transcript. Empty scope → no block.
+- Pin blocks go in whether or not the thread memory is usable.
+- Scope at or over its warn mark: its block ends with `<scope> memory <n>% full: tell the user once, offer to clean it up`.
+
+### Project memory
+
+One file per project: `<project dir>/.taskbot.md`. The file is the store. User and agent may edit it. Read fresh on every use.
+
+`ProjectMemory` = `{project, text, size, limit}`. `size` = chars of the whole file. `text` = the file; over `limit` → the first `limit` chars, cut on a line end. No file → no `ProjectMemory`.
+
+```
+# Taskbot: garden
+
+## Pinned
+- notes go under beds/, one file per bed
+
+## Tasks
+- 2026-10-12 split plan.md per bed -> done: 4 files
+```
+
+| section | holds | written by |
+|---|---|---|
+| `## Pinned` | `- <pin>` lines | `memory_note` / `memory_forget`, scope `project` |
+| `## Tasks` | last 20 finished `delegate` tasks of the project, newest first: `- <YYYY-MM-DD> <prompt, 80 chars> -> done: <answer, 120 chars>` or `-> failed: <error, 120 chars>`. One line each, UTC date. | server, when a task turns `done` / `failed` |
+| anything else | free | user, agent. Server never changes it. |
+
+- Server changes only bullet lines under `## Pinned` and `## Tasks`: one added, swapped or removed per write. All other bytes stay.
+- Section missing → added at the end of the file. File missing → made on the first write (`# Taskbot: <project>` on top). Never made on read.
+- One write at a time per project. Write = temp file in the same folder + rename.
+- Not UTF-8, or over 64 KiB: write → `{error}`, read → skipped, as if no file.
+- Limit check for scope `project` counts the whole file, not only `## Pinned`. `size` in a tool result of scope `project` = chars of the whole file.
+- `## Tasks` lines are written even when the file is over `limit`. No answer → the line ends at `-> done`.
+- Server never touches `.gitignore`.
+
+Active project of a thread, set by:
+
+| by | how |
+|---|---|
+| `delegate` | thread has none → the project of the call. Has one → no change. |
+| `set_project` tool | model, when the user says what they work on |
+| `threads.set_project` | user, picker in the app |
+
 Compact runs when any of:
 
 | trigger | detail |
@@ -221,7 +292,7 @@ Compact runs when any of:
 
 ## Tools (served via `tools.list`)
 
-Gemini gets read-only vault tools. All writes go through an agent session, so `CLAUDE.md` in the project rules.
+Gemini gets read-only vault tools, web search, and session control. All writes go through an agent session, so `CLAUDE.md` in the project rules. One exception: the server itself writes `.taskbot.md`, see "Project memory".
 
 | tool | args | result |
 |---|---|---|
@@ -232,7 +303,13 @@ Gemini gets read-only vault tools. All writes go through an agent session, so `C
 | `sessions` | `{}` | `{sessions:[Session]}` |
 | `tasks` | `{project?}` | `{tasks:[Task]}`, newest first. Every unfinished task + the 5 last finished. `project` given: that project only. |
 | `rename_thread` | `{name}` | `{thread:Thread}`. Renames the thread in `tool.call.thread_id`; none → `{error}`. Pushes `threads.changed`. |
+| `memory_note` | `{text, scope?, replaces?}` | `{scope, pins:[Pin], size, limit, warning?}` = that scope after the write. `scope` = `thread` (default) / `project` / `always`. `replaces` = part of an old pin of that scope: swapped in place; no hit → plain add. Same text again (case-insensitive) → no change. See "Pins". |
+| `memory_forget` | `{match}` | `{forgotten, from, pins:[Pin], size, limit}`. Removes the one pin that contains `match`. `from` = `thread` / `project` / `always`, searched in that order. Pins only: never `## State`, `## Recent`, `## Tasks`. |
+| `memory_read` | `{thread?, project?}` | No arg: `{threads:[{id, name, project?, pins, memory}], projects:[name]}`: other threads that hold pins or a memory (newest `last_accessed_at` first, max 50; `pins` = count, `memory` = bool) + projects with a `.taskbot.md`. `thread` (id, or part of the name): `{thread:{id, name}, pins:[Pin], memory?}`, `memory` = memory text. `project`: `{project, text}`. Read-only. |
+| `set_project` | `{project}` | `{thread:Thread}`. Sets the active project of the thread in `tool.call.thread_id`; none → `{error}`. `""` = no project. Unknown name → `{error}` naming the projects. Pushes `threads.changed`. |
 | `delegate` | `{project, prompt}` | `{status:"sent", project, task_id, state, queue_pos}`. Returns at once: `state` = `queued`. Progress: `tasks.changed`. Answer arrives later as `agent.say`. |
+| `web_search` | `{query}` | `{query, text, sources:[{title, uri}]}`. Server calls Gemini `generateContent` (`gemini_text_model`, tool `google_search`) with the server key. `text` = grounded answer. Max 8 sources. Server timeout 25 s. |
+| `end_conversation` | `{}` | `{status:"conversation_ended"}`. Server does nothing. App: voice running → stops the session once the result is stored, same as a mic tap. Not offered in text turns. |
 
 - Any tool failure → `{error:"..."}`.
 - Vault paths: relative to `vault_path`, no leading `/`. Canonicalise, reject anything outside `vault_path`.
@@ -272,6 +349,15 @@ Gemini gets read-only vault tools. All writes go through an agent session, so `C
 - `delegate`: unknown project or empty prompt → `{error}`. No session → spawn, wait until ready, then send prompt. Failure after `sent` → spoken via `agent.say`.
 - `delegate`: one job per project at a time, prompts stay in order.
 - `delegate`: makes one `Task`, see "Tasks". Its `thread_id` = `tool.call.thread_id`.
+- `delegate`: thread without an active project → the project becomes active, `threads.changed` pushed.
+- `delegate`: project has a `.taskbot.md` → the prompt sent to the agent starts with the line `Project notes kept by taskbot: .taskbot.md. Read it first.` + an empty line. `Task.prompt` stays as given.
+- `memory_note`, `memory_forget`: `match` / `replaces` = case-insensitive substring. More than one hit in a scope → `{error:"<n> notes match", matches:[text]}`.
+- `memory_forget`: the first scope with a hit decides. No hit in any → `{error:"no pinned note matches", pins:[Pin]}`, `pins` = every pin searched.
+- `memory_note` with `replaces`: new text equals another pin of the scope → the old pin is removed, no copy made.
+- `memory_note` scope `thread`, or `memory_forget`, without `tool.call.thread_id`: `thread` scope is skipped (`memory_note` → `{error}`). Scope `project` on a thread without an active project → `{error:"no active project"}`.
+- `memory_note` / `memory_forget` push: `thread` → `threads.memory`, `always` → `memory.always`, `project` → `memory.project`.
+- `memory_read` `thread`: one hit, else `{error}` naming the matches. The calling thread is left out of the list.
+- `memory_read` `project`: `text` cut as in `ProjectMemory`. No usable file → `{error}`.
 
 ## Agent sessions
 

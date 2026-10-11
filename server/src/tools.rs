@@ -1,5 +1,7 @@
 //! Tools offered to the voice model. Declarations use the Gemini
-//! `functionDeclarations[].parameters` shape. Vault tools only read.
+//! `functionDeclarations[].parameters` shape. Vault tools only read. The
+//! `memory_*` tools write pins: sqlite, or the project's `.taskbot.md`.
+//! `end_conversation` is acted on by the app: here it only answers.
 
 use crate::server::App;
 use serde_json::{json, Value};
@@ -87,6 +89,51 @@ pub fn declarations() -> Vec<Value> {
             &["name"],
         ),
         decl(
+            "memory_note",
+            "Pin one note so it is never forgotten. Call when user says remember, note, keep in mind, do not \
+             forget; or sets a standing rule (then call without mentioning it). scope: thread = this conversation \
+             (default, use when unsure); always = user says always, everywhere, in every conversation, from now \
+             on; project = rule or fact of the active project. One short keyword line per note, in user's \
+             language. Changed rule: pass replaces. Not for ordinary decisions, goals, questions or chit-chat. \
+             Result has warning: tell user once that this memory is nearly full, offer to clean up. error \
+             \"memory full\": tell user, offer to drop notes from the pins listed.",
+            json!({
+                "text": string("The note, one short line. E.g. \"budget max 200 EUR\"."),
+                "scope": string("thread (default), project or always."),
+                "replaces": string("Part of the old note this one replaces, same scope. Omit for a new note."),
+            }),
+            &["text"],
+        ),
+        decl(
+            "memory_forget",
+            "Remove one pinned note. Call when user says forget, drop, or that a pinned note is no longer true. \
+             Searches this conversation's notes, then the project's, then the always notes. Result names the \
+             note removed: tell user. Error with matches: several notes fit, ask user which or retry with a \
+             longer part. Only pinned notes can be removed.",
+            json!({"match": string("Part of the note to remove, case ignored. Enough words to hit one note.")}),
+            &["match"],
+        ),
+        decl(
+            "memory_read",
+            "Read what is remembered elsewhere. Call when user refers to another conversation or project, e.g. \
+             \"what did we say about the garden\". No argument: list of other conversations that hold notes \
+             or a memory + projects that have notes. thread: pinned notes and memory of that conversation. \
+             project: notes file of that project. Notes of this conversation and its active project are already \
+             in your context. Read-only.",
+            json!({
+                "thread": string("Conversation id, or part of its name."),
+                "project": string("Project name, exact."),
+            }),
+            &[],
+        ),
+        decl(
+            "set_project",
+            "Set the project this conversation is about. Call when user says what project they work on, or \
+             switches to another. Its notes then come with every later turn. Project names: projects tool.",
+            json!({"project": string("Project name, exact. \"\" = no project.")}),
+            &["project"],
+        ),
+        decl(
             "delegate",
             "Hand a task to the project's coding agent. Returns at once; agent's answer arrives later and is read \
              out; progress shows on user's screen, see it with tasks. Only way to change anything: create or edit notes, write code, run commands. You cannot write \
@@ -98,6 +145,21 @@ pub fn declarations() -> Vec<Value> {
                 ),
             }),
             &["project", "prompt"],
+        ),
+        decl(
+            "web_search",
+            "Search the internet with Google. Use for anything not in user's notes vault: news, current events, \
+             weather, prices, facts you are unsure of. Returns text = answer built from the found pages, sources = \
+             those pages. Slow, a few seconds. Do not read out URLs unless asked.",
+            json!({"query": string("What to look up, full question or keywords. Include place and date when they matter.")}),
+            &["query"],
+        ),
+        decl(
+            "end_conversation",
+            "End the voice conversation: mic and speaker go off at once. Use when user says goodbye or wants to \
+             stop talking. Say nothing after the call, nobody hears it.",
+            json!({}),
+            &[],
         ),
     ]
 }
@@ -127,6 +189,25 @@ fn line(args: &Value, key: &str) -> Result<Option<i64>, String> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
         .map(Some)
         .ok_or_else(|| format!("{key} must be a whole number"))
+}
+
+/// Optional string argument. Voice models also send `""` or `null` for "none".
+fn optional(args: &Value, key: &str) -> Option<String> {
+    args[key]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Memory tools: sqlite and one small file, blocking. Off the async workers.
+async fn memory<F>(app: &Arc<App>, f: F) -> Result<Value, String>
+where
+    F: FnOnce(&App) -> Result<Value, String> + Send + 'static,
+{
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || f(&app))
+        .await
+        .map_err(|e| format!("tool crashed: {e}"))?
 }
 
 /// Vault work is blocking file I/O: keep it off the async workers.
@@ -174,6 +255,42 @@ async fn run(
             let id = thread_id.ok_or("no thread_id in tool.call: no thread to rename")?;
             crate::server::rename_thread(app, id, text(args, "name")?)
         }
+        "memory_note" => {
+            let text = text(args, "text")?.to_string();
+            let (scope, replaces) = (optional(args, "scope"), optional(args, "replaces"));
+            let thread = thread_id.map(str::to_string);
+            memory(app, move |app| {
+                let (scope, replaces) = (scope.as_deref(), replaces.as_deref());
+                crate::memory::note(app, thread.as_deref(), &text, scope, replaces)
+            })
+            .await
+        }
+        "memory_forget" => {
+            let needle = text(args, "match")?.to_string();
+            let thread = thread_id.map(str::to_string);
+            memory(app, move |app| {
+                crate::memory::forget(app, thread.as_deref(), &needle)
+            })
+            .await
+        }
+        "memory_read" => {
+            let (wanted, project) = (optional(args, "thread"), optional(args, "project"));
+            let caller = thread_id.map(str::to_string);
+            memory(app, move |app| {
+                crate::memory::read(
+                    app,
+                    caller.as_deref(),
+                    wanted.as_deref(),
+                    project.as_deref(),
+                )
+            })
+            .await
+        }
+        "set_project" => {
+            let id =
+                thread_id.ok_or("no thread_id in tool.call: no thread to set the project of")?;
+            crate::memory::set_project(app, id, text(args, "project")?)
+        }
         "tasks" => Ok(json!({"tasks": app.tasks.recent(args["project"].as_str())})),
         "delegate" => crate::agents::delegate(
             app,
@@ -181,6 +298,8 @@ async fn run(
             text(args, "prompt")?,
             thread_id,
         ),
+        "web_search" => crate::search::search(app, text(args, "query")?).await,
+        "end_conversation" => Ok(json!({"status": "conversation_ended"})),
         other => Err(format!("unknown tool {other:?}")),
     }
 }
@@ -203,7 +322,13 @@ mod tests {
                 "sessions",
                 "tasks",
                 "rename_thread",
-                "delegate"
+                "memory_note",
+                "memory_forget",
+                "memory_read",
+                "set_project",
+                "delegate",
+                "web_search",
+                "end_conversation"
             ]
         );
         for d in &decls {

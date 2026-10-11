@@ -2,6 +2,7 @@
 //! through the session's channel shim, status from Claude Code's session files.
 
 use crate::config::Config;
+use crate::project_file;
 use crate::server::App;
 use crate::tasks::{self, State};
 use serde::Serialize;
@@ -110,7 +111,8 @@ pub fn shim_port(app: &App, project: &str) -> Result<u16, String> {
 
 /// Validate, record a `Task`, then hand the work to a background job and
 /// return at once. What happens afterwards is pushed as `tasks.changed` and
-/// `agent.event`. `thread_id` = the conversation the call came from.
+/// `agent.event`. `thread_id` = the conversation the call came from: a thread
+/// without an active project takes this one.
 pub fn delegate(
     app: &Arc<App>,
     project: &str,
@@ -136,6 +138,7 @@ pub fn delegate(
         .tasks
         .create(project, thread_id, prompt, crate::now_ms());
     tasks::push(app, vec![task.clone()]);
+    crate::memory::adopt_project(app, thread_id, project);
 
     let job = Job {
         app: app.clone(),
@@ -219,13 +222,19 @@ impl Job {
             self.app
                 .push_event(&self.project, "spawned", Value::String(detail));
         }
+        // Looked up at delivery: the file may have been made while the task waited.
+        let body = if project_file::path(&self.dir).is_file() {
+            format!("{}\n\n{}", project_file::NOTES_LINE, self.prompt)
+        } else {
+            self.prompt.clone()
+        };
         let resp = self
             .app
             .http
             .post(format!("{shim}/prompt"))
             .header("content-type", "text/plain; charset=utf-8")
             .header("x-task-id", &self.task_id)
-            .body(self.prompt.clone())
+            .body(body)
             .timeout(PROMPT_TIMEOUT)
             .send()
             .await

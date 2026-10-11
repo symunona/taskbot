@@ -1,8 +1,11 @@
 pub mod agents;
 pub mod compact;
 pub mod config;
+pub mod memory;
 pub mod net;
 pub mod outline;
+pub mod project_file;
+pub mod search;
 pub mod server;
 pub mod state;
 pub mod tasks;

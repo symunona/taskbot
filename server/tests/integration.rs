@@ -292,7 +292,13 @@ async fn pair_then_tools_and_agent_say() {
             "sessions",
             "tasks",
             "rename_thread",
-            "delegate"
+            "memory_note",
+            "memory_forget",
+            "memory_read",
+            "set_project",
+            "delegate",
+            "web_search",
+            "end_conversation"
         ]
     );
     assert_eq!(tools["tools"][0]["parameters"]["type"], "OBJECT");
@@ -1003,11 +1009,12 @@ async fn request_quiet(ws: &mut Ws, event: &str, payload: Value) -> Value {
     }
 }
 
-/// Next push that is not `tasks.changed`.
+/// Next push that is not `tasks.changed` or `memory.project` (the task log
+/// line of a finished task).
 async fn next_agent(ws: &mut Ws) -> Value {
     loop {
         let push = next(ws).await.expect("socket closed");
-        if push["event"] != "tasks.changed" {
+        if push["event"] != "tasks.changed" && push["event"] != "memory.project" {
             return push;
         }
     }

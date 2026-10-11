@@ -28,7 +28,7 @@ const INSTRUCTION: &str = "\
 You maintain the memory file of a conversation between a user and a voice assistant. \
 The assistant reads this file instead of the old conversation, so it must say where things stand now. It is not a history.
 
-Input: the current memory (may be empty) and the new part of the conversation. Output: the full updated memory, nothing else.
+Input: the current memory (may be empty), pinned notes (read-only, may be absent) and the new part of the conversation. Output: the full updated memory, nothing else.
 
 Format, exactly two sections:
 ## State
@@ -43,6 +43,8 @@ Rules:
 - Recent rolls: keep the newest 10 lines at most, drop older ones.
 - Drop greetings, chit-chat and the bodies of tool results. A file path named in a decision stays, exact.
 - Keep every State bullet from the current memory that is still true.
+- Pinned notes live elsewhere. Never repeat one in State.
+- A State bullet that a pinned note contradicts: drop it.
 - Same language as the conversation.
 - At most 1400 characters. No preamble, no code fence.";
 
@@ -189,9 +191,14 @@ pub fn tidy(raw: &str) -> String {
     }
 }
 
-fn prompt(memory: Option<&str>, lines: &[String]) -> String {
+/// Fold input. `pinned` = the pins in force, read-only; none: no block.
+fn prompt(memory: Option<&str>, pinned: &[String], lines: &[String]) -> String {
+    let pinned: String = match pinned {
+        [] => String::new(),
+        pins => format!("<pinned>\n- {}\n</pinned>\n", pins.join("\n- ")),
+    };
     format!(
-        "<memory>\n{}\n</memory>\n<conversation>\n{}\n</conversation>",
+        "<memory>\n{}\n</memory>\n{pinned}<conversation>\n{}\n</conversation>",
         memory.unwrap_or(""),
         lines.join("\n")
     )
@@ -201,6 +208,7 @@ fn prompt(memory: Option<&str>, lines: &[String]) -> String {
 async fn fold(
     app: &App,
     memory: Option<&str>,
+    pinned: &[String],
     lines: &[String],
 ) -> Result<(String, Usage), String> {
     let key = app
@@ -214,7 +222,7 @@ async fn fold(
     );
     let body = json!({
         "systemInstruction": {"parts": [{"text": INSTRUCTION}]},
-        "contents": [{"role": "user", "parts": [{"text": prompt(memory, lines)}]}],
+        "contents": [{"role": "user", "parts": [{"text": prompt(memory, pinned, lines)}]}],
         "generationConfig": {"temperature": 0.2},
     });
     let resp = app
@@ -274,18 +282,12 @@ pub fn payload(memory: Option<Memory>, usage: Usage) -> Value {
 }
 
 /// Compact a thread if `why` still holds once it is this call's turn.
-/// `Ok` = `{memory?, usage}` as it stands afterwards.
+/// `Ok` = `{memory?, usage, pins}` as it stands afterwards. Pins go into the
+/// fold as input only: a compact never writes one.
 pub async fn run(app: &App, id: &str, why: Why) -> Result<Value, String> {
     let lock = app.compactor.lock(id);
     let _one_at_a_time = lock.lock().await;
-    let current = || -> Result<Value, String> {
-        let (memory, usage) = app
-            .store
-            .thread_memory(id)
-            .map_err(db)?
-            .ok_or_else(|| format!("unknown thread {id:?}"))?;
-        Ok(payload(memory, usage))
-    };
+    let current = || crate::memory::thread_payload(app, id);
     if why != Why::Request && app.compactor.backing_off(id) {
         return current();
     }
@@ -307,7 +309,9 @@ pub async fn run(app: &App, id: &str, why: Why) -> Result<Value, String> {
         let Some(chunk) = chunk(&state.entries) else {
             return current();
         };
-        let (text, used) = match fold(app, state.summary.as_deref(), &chunk.lines).await {
+        let pinned = crate::memory::pinned_for_fold(app, id)?;
+        let call = fold(app, state.summary.as_deref(), &pinned, &chunk.lines);
+        let (text, used) = match call.await {
             Ok(done) => done,
             Err(e) => {
                 tracing::warn!("compact of thread {id} failed: {e}");

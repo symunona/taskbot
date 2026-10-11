@@ -9,6 +9,8 @@ import space.tmpx.taltosbot.connection.EntryKind
 import space.tmpx.taltosbot.connection.MARKER_VOICE_ENDED
 import space.tmpx.taltosbot.connection.MARKER_VOICE_STARTED
 import space.tmpx.taltosbot.connection.PairingStore
+import space.tmpx.taltosbot.connection.Pins
+import space.tmpx.taltosbot.connection.ProjectMemory
 import space.tmpx.taltosbot.connection.ServerApi
 import space.tmpx.taltosbot.connection.ServerConnection
 import space.tmpx.taltosbot.connection.ServerPush
@@ -25,6 +27,7 @@ import space.tmpx.taltosbot.llm.GEMINI_BASE_URL
 import space.tmpx.taltosbot.llm.GeminiTextClient
 import space.tmpx.taltosbot.llm.estimateTokens
 import space.tmpx.taltosbot.llm.historyChars
+import space.tmpx.taltosbot.llm.pinnedChars
 import space.tmpx.taltosbot.llm.runTextTurn
 import space.tmpx.taltosbot.llm.textHistory
 import space.tmpx.taltosbot.llm.textSystemInstruction
@@ -45,8 +48,10 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.datetime.Clock
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlin.random.Random
@@ -56,13 +61,21 @@ const val SYSTEM_INSTRUCTION =
         "through your tools. You cannot write, save, build or do longer work yourself: for any of " +
         "that, call `delegate` with the right project and a clear prompt. `delegate` returns " +
         "immediately; the project agent's answer arrives later as a message for you to relay. " +
+        "Fresh facts from outside the vault: `web_search`. " +
         "Speak caveman brief, except when asked to elaborate. Single word confirms, yes/no " +
         "answers when possible. " +
         "Paths, file and folder names: say only the relevant part, usually the last name, no " +
         "extension. Skip Johnny Decimal numbers: say \"Taxes\", not \"12.03 Taxes\" or " +
         "\"10-19 Finance\". Never read out server directories or full paths unless asked. " +
         "In tool calls use the exact path, numbers included. " +
-        "Once the topic is clear, name the thread with `rename_thread` (a few words), without mentioning it."
+        "Once the topic is clear, name the thread with `rename_thread` (a few words), without mentioning it. " +
+        "User says remember / note / do not forget: `memory_note`, one short keyword line. Standing " +
+        "rule for this conversation: `memory_note` too, without mentioning it. Always / everywhere / " +
+        "from now on: scope `always`. Rule or fact of the project: scope `project`. Changed rule: " +
+        "`replaces`. Not for ordinary decisions. Forget / drop / no longer true: `memory_forget`. " +
+        "User refers to another conversation or project: `memory_read`. User says what project they " +
+        "work on: `set_project`. Tool result has `warning`, or a memory block says it is nearly " +
+        "full: tell the user once, offer to clean up."
 
 enum class VoiceState { Idle, Connecting, Active }
 
@@ -105,6 +118,20 @@ class AppController {
         private set
     /** Thread memory of [currentThread]: what the model gets instead of the folded entries. Null = never compacted. */
     var memory by mutableStateOf<ThreadMemory?>(null)
+        private set
+    /** `always` pins: in the prompt of every thread. */
+    var always by mutableStateOf(Pins())
+        private set
+    /** Pins of [currentThread]. */
+    var pins by mutableStateOf(Pins())
+        private set
+    /** Memory of the active project of [currentThread]. Null = no project, or it has no `.taskbot.md`. */
+    var projectMemory by mutableStateOf<ProjectMemory?>(null)
+        private set
+    /** Project names for the picker, from the `projects` tool. */
+    var projects by mutableStateOf(listOf<String>())
+        private set
+    var projectError by mutableStateOf<String?>(null)
         private set
     /** Token use of [currentThread], all time, as the server counts it. */
     var usage by mutableStateOf(TokenUse())
@@ -215,6 +242,8 @@ class AppController {
         threadLoading = false
         entries = emptyList()
         resetMemory()
+        always = Pins()
+        projects = emptyList()
         dirty.clear()
     }
 
@@ -254,9 +283,12 @@ class AppController {
             }
             is ServerPush.ThreadChanged -> upsertThread(push.thread)
             is ServerPush.ThreadMemoryChanged -> if (push.threadId == currentThread?.id) {
-                memory = push.memory ?: memory
+                memory = push.memory
+                pins = push.pins
                 usage = push.usage
             }
+            is ServerPush.AlwaysChanged -> always = push.pins
+            is ServerPush.ProjectMemoryChanged -> if (push.memory.project == currentThread?.project) projectMemory = push.memory
             // UI state only. Deliberately not sent to Gemini: a text turn would cut into live speech.
             is ServerPush.TaskChanged -> tasks = upsertTask(tasks, push.task)
         }
@@ -374,7 +406,7 @@ class AppController {
         scope.launch {
             try {
                 threads = connection.listThreads().sortedByDescending { it.lastAccessedAt }
-                threads.firstOrNull { it.id == currentThread?.id }?.let { currentThread = it }
+                threads.firstOrNull { it.id == currentThread?.id }?.let(::setCurrent)
                 threadsError = null
             } catch (e: CancellationException) {
                 throw e
@@ -386,14 +418,35 @@ class AppController {
 
     private fun upsertThread(thread: ThreadInfo) {
         threads = (threads.filter { it.id != thread.id } + thread).sortedByDescending { it.lastAccessedAt }
-        if (currentThread?.id == thread.id) currentThread = thread
+        if (currentThread?.id == thread.id) setCurrent(thread)
+    }
+
+    /** New state of the thread on screen. Active project changed: its memory comes with a fresh `threads.get`. */
+    private fun setCurrent(thread: ThreadInfo) {
+        val projectChanged = currentThread?.project != thread.project
+        currentThread = thread
+        if (projectChanged) {
+            if (projectMemory?.project != thread.project) projectMemory = null
+            refreshMemory()
+        }
     }
 
     /** Makes [thread] the one on screen. */
-    private fun showThread(thread: ThreadInfo, loaded: List<Entry>, loadedMemory: ThreadMemory? = null, loadedUsage: TokenUse = TokenUse()) {
+    private fun showThread(
+        thread: ThreadInfo,
+        loaded: List<Entry>,
+        loadedMemory: ThreadMemory? = null,
+        loadedUsage: TokenUse = TokenUse(),
+        loadedPins: Pins = Pins(),
+        loadedAlways: Pins? = null,
+        loadedProject: ProjectMemory? = null
+    ) {
         resetMemory()
         memory = loadedMemory
         usage = loadedUsage
+        pins = loadedPins
+        loadedAlways?.let { always = it }
+        projectMemory = loadedProject?.takeIf { it.project == thread.project }
         // Entries of this thread still waiting to be stored win over what the server has.
         val pending = dirty[thread.id].orEmpty()
         val known = loaded.distinctBy { it.id }.map { pending[it.id] ?: it }
@@ -406,10 +459,11 @@ class AppController {
 
     /** The current thread; none yet -> create one. Entries shown so far move into it. */
     private suspend fun ensureThread(): ThreadInfo = threadMutex.withLock {
-        currentThread ?: connection.createThread().also { thread ->
+        currentThread ?: connection.createThread().let { created ->
             val local = entries
-            showThread(thread, emptyList())
-            local.forEach { putEntry(it, thread.id) }
+            showThread(created.thread, emptyList(), loadedAlways = created.always)
+            local.forEach { putEntry(it, created.thread.id) }
+            created.thread
         }
     }
 
@@ -419,7 +473,8 @@ class AppController {
         loadJob?.cancel()
         loadJob = scope.launch {
             try {
-                showThread(connection.createThread(), emptyList())
+                val created = connection.createThread()
+                showThread(created.thread, emptyList(), loadedAlways = created.always)
                 threadsError = null
             } catch (e: CancellationException) {
                 throw e
@@ -438,7 +493,7 @@ class AppController {
         loadJob = scope.launch {
             try {
                 val got = connection.getThread(id)
-                showThread(got.thread, got.entries, got.memory, got.usage)
+                showThread(got.thread, got.entries, got.memory, got.usage, got.pins, got.always, got.projectMemory)
                 threadsError = null
             } catch (e: CancellationException) {
                 throw e
@@ -473,6 +528,9 @@ class AppController {
 
     private fun resetMemory() {
         memory = null
+        pins = Pins()
+        projectMemory = null
+        projectError = null
         usage = TokenUse()
         contextTokens = null
         compacting = false
@@ -486,13 +544,14 @@ class AppController {
             return entries.drop(at + 1).count { it.kind == EntryKind.USER && it.text.isNotBlank() }
         }
 
-    /** Tokens of history + memory a text turn would send now. A guess: chars / 4, tool declarations not counted. */
+    /** Tokens of history + memory + pins a text turn would send now. A guess: chars / 4, tool declarations not counted. */
     val contextEstimate: Long
         get() = estimateTokens(
-            textSystemInstruction(SYSTEM_INSTRUCTION, entries, memory).length + historyChars(textHistory(entries, memory))
+            textSystemInstruction(SYSTEM_INSTRUCTION, entries, memory, always, projectMemory, pins).length +
+                historyChars(textHistory(entries, memory))
         )
 
-    /** Memory + token use as the server has them now: a `threads.memory` push may have been missed while offline. */
+    /** Memory, pins + token use as the server has them now: a push may have been missed while offline. */
     fun refreshMemory() {
         val threadId = currentThread?.id ?: return
         if (connection.state.value != ConnState.Connected) return
@@ -502,11 +561,47 @@ class AppController {
                 if (currentThread?.id == threadId) {
                     memory = got.memory
                     usage = got.usage
+                    pins = got.pins
+                    always = got.always
+                    projectMemory = got.projectMemory?.takeIf { it.project == got.thread.project }
+                    // A `threads.changed` missed while offline.
+                    if (got.thread.project != currentThread?.project) upsertThread(got.thread)
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
                 EventLogger.log("Threads: memory refresh failed (${e.message ?: e})", isError = true)
+            }
+        }
+    }
+
+    /** Project names for the picker. The app keeps no list of its own: it asks the `projects` tool. */
+    fun refreshProjects() {
+        if (connection.state.value != ConnState.Connected) return
+        scope.launch {
+            val result = connection.callTool("projects", buildJsonObject {})
+            val names = (result["projects"] as? JsonArray).orEmpty()
+                .mapNotNull { ((it as? JsonObject)?.get("name") as? JsonPrimitive)?.content?.takeIf { name -> name.isNotBlank() } }
+            if (names.isNotEmpty() || result["error"] == null) projects = names
+        }
+    }
+
+    /** The project picker: sets the active project of the thread on screen. `""` = none. */
+    fun setProject(project: String) {
+        val thread = currentThread ?: return
+        if (project == (thread.project ?: "")) return
+        if (connection.state.value != ConnState.Connected) {
+            projectError = "Server not connected"
+            return
+        }
+        projectError = null
+        scope.launch {
+            try {
+                upsertThread(connection.setThreadProject(thread.id, project))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                if (currentThread?.id == thread.id) projectError = "Project not set: ${e.message ?: e}"
             }
         }
     }
@@ -525,9 +620,10 @@ class AppController {
             try {
                 // The server folds what it has stored: send the queued entries first.
                 flush()
-                val (newMemory, newUsage) = connection.compactThread(threadId)
+                val (newMemory, newUsage, newPins) = connection.compactThread(threadId)
                 if (currentThread?.id == threadId) {
                     memory = newMemory ?: memory
+                    pins = newPins
                     usage = newUsage
                 }
             } catch (e: CancellationException) {
@@ -652,17 +748,20 @@ class AppController {
                 threadId = thread.id
                 putEntry(Entry(newId("u"), now(), EntryKind.USER, text), thread.id)
                 val history = textHistory(entries, memory)
-                val instruction = textSystemInstruction(SYSTEM_INSTRUCTION, entries, memory)
+                val instruction = textSystemInstruction(SYSTEM_INSTRUCTION, entries, memory, always, projectMemory, pins)
+                val pinned = pinnedChars(always, projectMemory, pins)
                 EventLogger.log(
                     "Context: text turn sends ${historyChars(history)} chars of history in ${history.size} turns, " +
-                        "${instruction.length - SYSTEM_INSTRUCTION.length} chars of memory (${entries.size} entries in thread)"
+                        "${instruction.length - SYSTEM_INSTRUCTION.length - pinned} chars of memory, " +
+                        "$pinned chars of pins + project memory (${entries.size} entries in thread)"
                 )
                 val answer = runTextTurn(
                     client = textClient,
                     apiKey = config.apiKey,
                     model = config.textModel,
                     systemInstruction = instruction,
-                    tools = connection.tools.value,
+                    // Nothing to end in a text turn.
+                    tools = JsonArray(connection.tools.value.filter { (it as? JsonObject)?.get("name") != JsonPrimitive(TOOL_END_CONVERSATION) }),
                     history = history,
                     onUsage = { used ->
                         tokensIn += used.input
@@ -714,10 +813,11 @@ class AppController {
                 stopVoice("Voice not started: ${e.message ?: e}", isError = true)
                 return@launch
             }
-            val instruction = voiceSystemInstruction(SYSTEM_INSTRUCTION, entries, memory)
+            val instruction = voiceSystemInstruction(SYSTEM_INSTRUCTION, entries, memory, always, projectMemory, pins)
+            val pinned = pinnedChars(always, projectMemory, pins)
             EventLogger.log(
-                "Context: voice start sends ${instruction.length - SYSTEM_INSTRUCTION.length} chars of memory + history " +
-                    "(${entries.size} entries in thread)"
+                "Context: voice start sends ${instruction.length - SYSTEM_INSTRUCTION.length - pinned} chars of memory + history, " +
+                    "$pinned chars of pins + project memory (${entries.size} entries in thread)"
             )
             lateinit var session: VoiceSession
             session = VoiceSession(
@@ -726,7 +826,12 @@ class AppController {
                 // What was typed or said before on this thread rides along: memory + transcript block.
                 systemInstruction = instruction,
                 tools = connection.tools.value,
-                executeTool = { name, args -> runTool(thread.id, name, args) },
+                executeTool = { name, args ->
+                    runTool(thread.id, name, args).also {
+                        // The model asked to hang up. Its call is stored; the session goes down like a mic tap.
+                        if (name == TOOL_END_CONVERSATION) scope.launch { if (voiceSession === session) stopVoice(note = null) }
+                    }
+                },
                 onEnded = { reason ->
                     // Called from a background dispatcher.
                     scope.launch { if (voiceSession === session) stopVoice(reason, isError = true) }
@@ -746,6 +851,11 @@ class AppController {
                     voiceState = VoiceState.Active
                     voiceMarkedThread = thread.id
                     putEntry(Entry(newId("k"), now(), EntryKind.MARKER, MARKER_VOICE_STARTED), thread.id)
+                    // Gemini cuts a Live connection at ~10 min. Leave first, without an error.
+                    launch {
+                        delay(VOICE_MAX_MS)
+                        if (voiceSession === session) stopVoice("Voice off: 9 min limit. Tap the mic to go on.")
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -808,6 +918,8 @@ class AppController {
         private const val KEY_LAST_THREAD = "last_thread_id"
         private const val KEY_TEXT_BASE_URL = "gemini_text_base_url"
         private const val FLUSH_DELAY_MS = 600L
+        private const val VOICE_MAX_MS = 9 * 60_000L
+        private const val TOOL_END_CONVERSATION = "end_conversation"
         private const val FLUSH_RETRY_MS = 5_000L
         private const val APPEND_MAX_ENTRIES = 200
         private const val APPEND_MAX_BYTES = 600_000

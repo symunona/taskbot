@@ -42,6 +42,33 @@ const newThread = (name, at = Date.now()) => {
   seeded.entries.set('seed-2', { id: 'seed-2', ts: at + 900, kind: 'tool', text: '', tool: { name: 'read_file', args: { path: 'garden.md' }, result: { content: 'Plant beans in May.' }, called_at: at + 900, result_at: at + 1400 } });
   seeded.entries.set('seed-3', { id: 'seed-3', ts: at + 2000, kind: 'model', text: 'Beans in May.', voice: true });
 }
+// Pins + project memory: docs/protocol.md "Pins", "Project memory". Thread pins live in t.pins.
+const projects = [{ name: 'vault', dir: '/mock/vault' }, { name: 'taskbot', dir: '/mock/taskbot' }];
+const always = [{ text: 'answer in short sentences', at: Date.now() }];
+const projectFiles = new Map([['vault', '# Taskbot: vault\n\n## Pinned\n- notes go under inbox/\n\n## Tasks\n- 2026-10-12 add a note about tea -> done: added\n']]);
+const pinsOf = (list, limit) => ({ pins: list, size: list.reduce((n, p) => n + p.text.length + 1, 0), limit });
+const projectMemory = (project) => (projectFiles.has(project) ? { project_memory: { project, text: projectFiles.get(project), size: projectFiles.get(project).length, limit: 3000 } } : {});
+const setProject = (id, project) => {
+  const t = threads.get(id);
+  if (!t) return { error: 'unknown thread' };
+  if (project && !projects.some((p) => p.name === project)) return { error: `unknown project ${project}` };
+  if (project) t.thread.project = project; else delete t.thread.project;
+  broadcast('threads.changed', { thread: t.thread });
+  return { thread: t.thread };
+};
+// Plain add, scopes `thread` and `always` only. No `replaces`, no limits.
+const memoryNote = (args, thread_id) => {
+  const t = threads.get(thread_id), pin = { text: String(args?.text ?? '').trim().slice(0, 300), at: Date.now() };
+  if (args?.scope === 'always') {
+    always.push(pin);
+    broadcast('memory.always', pinsOf(always, 1200));
+    return { scope: 'always', ...pinsOf(always, 1200) };
+  }
+  if (!t) return { error: 'no thread' };
+  (t.pins ??= []).push(pin);
+  broadcast('threads.memory', { thread_id, ...(t.memory ? { memory: t.memory } : {}), pins: pinsOf(t.pins, 1500), usage: t.usage ?? { input: 0, output: 0 } });
+  return { scope: 'thread', ...pinsOf(t.pins, 1500) };
+};
 const cleanName = (name) => String(name ?? '').replace(/[\u0000-\u001f]/g, '').trim().slice(0, 80);
 const rename = (id, name) => {
   const t = threads.get(id), clean = cleanName(name);
@@ -115,6 +142,9 @@ function onMessage(sock, msg) {
     if (name === 'rename_thread') result = thread_id ? rename(thread_id, args?.name) : { error: 'no thread' };
     if (name === 'delegate') result = delegate(args, thread_id);
     if (name === 'tasks') result = { tasks: [...tasks.values()].reverse() };
+    if (name === 'projects') result = { projects };
+    if (name === 'set_project') result = thread_id ? setProject(thread_id, args?.project) : { error: 'no thread' };
+    if (name === 'memory_note') result = memoryNote(args, thread_id);
     // Slow enough to see the "running" state of the chat entry.
     return setTimeout(() => wsSend(sock, 'tool.result', { result }, msg.id), 1500);
   }
@@ -125,7 +155,11 @@ function onMessage(sock, msg) {
   if (msg.event === 'threads.create') {
     const thread = newThread(cleanName(msg.payload?.name));
     broadcast('threads.changed', { thread });
-    return wsSend(sock, 'threads.create.result', { thread }, msg.id);
+    return wsSend(sock, 'threads.create.result', { thread, always: pinsOf(always, 1200) }, msg.id);
+  }
+  if (msg.event === 'threads.set_project') {
+    const r = setProject(msg.payload?.id, msg.payload?.project);
+    return r.error ? wsSend(sock, 'error', r, msg.id) : wsSend(sock, 'threads.set_project.result', r, msg.id);
   }
   if (msg.event === 'threads.rename') {
     const r = rename(msg.payload?.id, msg.payload?.name);
@@ -135,7 +169,7 @@ function onMessage(sock, msg) {
     const t = threads.get(msg.payload?.id);
     if (!t) return wsSend(sock, 'error', { error: 'unknown thread' }, msg.id);
     t.usage ??= { input: 0, output: 0 };
-    const state = () => ({ ...(t.memory ? { memory: t.memory } : {}), usage: t.usage });
+    const state = () => ({ ...(t.memory ? { memory: t.memory } : {}), usage: t.usage, pins: pinsOf(t.pins ?? [], 1500) });
     if (msg.event === 'threads.usage') {
       t.usage = { input: t.usage.input + msg.payload.input, output: t.usage.output + msg.payload.output };
       return wsSend(sock, 'threads.usage.result', { usage: t.usage }, msg.id);
@@ -150,7 +184,7 @@ function onMessage(sock, msg) {
       return wsSend(sock, 'threads.compact.result', state(), msg.id);
     }
     t.thread.last_accessed_at = Date.now();
-    if (msg.event === 'threads.get') return wsSend(sock, 'threads.get.result', { thread: t.thread, entries: [...t.entries.values()], ...state() }, msg.id);
+    if (msg.event === 'threads.get') return wsSend(sock, 'threads.get.result', { thread: t.thread, entries: [...t.entries.values()], ...state(), always: pinsOf(always, 1200), ...projectMemory(t.thread.project) }, msg.id);
     const entries = msg.payload.entries || [];
     if (entries.length > 200) return wsSend(sock, 'error', { error: 'too many entries' }, msg.id);
     entries.forEach((e) => t.entries.set(e.id, e)); // Map keeps the first-insert slot on replace

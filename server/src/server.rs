@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::state::{self, Device, Store};
 use crate::tasks::{self, Tasks};
 use crate::vault::Vault;
-use crate::{iso, now_ms, now_secs, tools};
+use crate::{iso, memory, now_ms, now_secs, tools};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Path as UrlPath, Request, State};
@@ -35,7 +35,8 @@ const MAX_WS_MESSAGE: usize = 1024 * 1024;
 /// What every authenticated socket hears about.
 #[derive(Clone, Debug)]
 pub enum Push {
-    /// A ready-to-send frame (`agent.say`, `agent.event`, `threads.changed`, `threads.memory`, `tasks.changed`).
+    /// A ready-to-send frame (`agent.say`, `agent.event`, `threads.changed`, `threads.memory`,
+    /// `memory.always`, `memory.project`, `tasks.changed`).
     Frame(String),
     /// This device was revoked: its sockets must go.
     Revoked(String),
@@ -642,8 +643,13 @@ async fn handle_frame(app: &Arc<App>, text: &str) -> String {
             json!({"tasks": app.tasks.list(now_ms())}),
         ),
         Some(
-            event @ ("threads.list" | "threads.create" | "threads.get" | "threads.rename"
-            | "threads.append" | "threads.usage"),
+            event @ ("threads.list"
+            | "threads.create"
+            | "threads.get"
+            | "threads.rename"
+            | "threads.append"
+            | "threads.usage"
+            | "threads.set_project"),
         ) => match threads(app, event, payload) {
             Ok(result) => {
                 if event == "threads.append" {
@@ -728,8 +734,9 @@ fn threads(app: &App, event: &str, payload: &Value) -> Result<Value, String> {
                 _ => return Err("threads.create: name must be a string".into()),
             };
             let thread = app.store.create_thread(&name, now_ms()).map_err(db_error)?;
-            let payload = json!({ "thread": thread });
+            let mut payload = json!({ "thread": thread });
             app.push("threads.changed", payload.clone());
+            payload["always"] = memory::always_pins(app)?;
             Ok(payload)
         }
         "threads.get" => {
@@ -747,6 +754,16 @@ fn threads(app: &App, event: &str, payload: &Value) -> Result<Value, String> {
                     reply["memory"] = memory.clone();
                 }
             }
+            reply["pins"] = memory::thread_pins(app, id)?;
+            reply["always"] = memory::always_pins(app)?;
+            // Read fresh: hand edits and agent edits of the file count at once.
+            let project_memory = thread
+                .project
+                .as_deref()
+                .and_then(|project| memory::project_memory(app, project));
+            if let Some(project_memory) = project_memory {
+                reply["project_memory"] = project_memory;
+            }
             Ok(reply)
         }
         "threads.rename" => {
@@ -754,6 +771,12 @@ fn threads(app: &App, event: &str, payload: &Value) -> Result<Value, String> {
                 .as_str()
                 .ok_or("threads.rename needs payload.name")?;
             rename_thread(app, id()?, name)
+        }
+        "threads.set_project" => {
+            let project = payload["project"]
+                .as_str()
+                .ok_or("threads.set_project needs payload.project")?;
+            memory::set_project(app, id()?, project)
         }
         "threads.append" => {
             let id = id()?;

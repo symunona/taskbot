@@ -47,7 +47,12 @@ sealed class ServerPush {
     data class AgentSay(val project: String, val text: String, val id: String? = null) : ServerPush()
     data class AgentEvent(val project: String, val kind: String, val detail: String) : ServerPush()
     data class ThreadChanged(val thread: ThreadInfo) : ServerPush()
-    data class ThreadMemoryChanged(val threadId: String, val memory: ThreadMemory?, val usage: TokenUse) : ServerPush()
+    /** `threads.memory`. [memory] null = never compacted. */
+    data class ThreadMemoryChanged(val threadId: String, val memory: ThreadMemory?, val usage: TokenUse, val pins: Pins = Pins()) : ServerPush()
+    /** `memory.always`: the `always` pins, for every thread. */
+    data class AlwaysChanged(val pins: Pins) : ServerPush()
+    /** `memory.project`: the server wrote the `.taskbot.md` of that project. */
+    data class ProjectMemoryChanged(val memory: ProjectMemory) : ServerPush()
     /** `tasks.changed`: state for the UI. Never goes to the voice model. */
     data class TaskChanged(val task: TaskInfo) : ServerPush()
 }
@@ -295,7 +300,18 @@ class ServerConnection(
                 ServerPush.AgentEvent(payload.str("project") ?: "?", payload.str("kind") ?: "?", payload["detail"].asText())
             )
             "threads.memory" -> payload.str("thread_id")?.let {
-                _pushes.emit(ServerPush.ThreadMemoryChanged(it, parseMemory(payload["memory"] as? JsonObject), parseUsage(payload["usage"] as? JsonObject)))
+                _pushes.emit(
+                    ServerPush.ThreadMemoryChanged(
+                        it,
+                        parseMemory(payload["memory"] as? JsonObject),
+                        parseUsage(payload["usage"] as? JsonObject),
+                        parsePins(payload["pins"] as? JsonObject)
+                    )
+                )
+            }
+            "memory.always" -> _pushes.emit(ServerPush.AlwaysChanged(parsePins(payload)))
+            "memory.project" -> parseProjectMemory(payload)?.let {
+                _pushes.emit(ServerPush.ProjectMemoryChanged(it))
             }
             "threads.changed" -> parseThread(payload["thread"] as? JsonObject)?.let {
                 _pushes.emit(ServerPush.ThreadChanged(it))
@@ -387,9 +403,10 @@ class ServerConnection(
         return (reply["threads"] as? JsonArray).orEmpty().mapNotNull { parseThread(it as? JsonObject) }
     }
 
-    suspend fun createThread(name: String? = null): ThreadInfo {
+    suspend fun createThread(name: String? = null): CreatedThread {
         val reply = request("threads.create", buildJsonObject { name?.let { put("name", it) } })
-        return parseThread(reply["thread"] as? JsonObject) ?: throw ServerErrorException("threads.create: no thread in reply")
+        val thread = parseThread(reply["thread"] as? JsonObject) ?: throw ServerErrorException("threads.create: no thread in reply")
+        return CreatedThread(thread, (reply["always"] as? JsonObject)?.let(::parsePins))
     }
 
     /** Thread + its entries in `seq` order. */
@@ -397,13 +414,30 @@ class ServerConnection(
         val reply = request("threads.get", buildJsonObject { put("id", id) })
         val thread = parseThread(reply["thread"] as? JsonObject) ?: throw ServerErrorException("threads.get: no thread in reply")
         val entries = (reply["entries"] as? JsonArray).orEmpty().mapNotNull { (it as? JsonObject)?.let(::parseEntry) }
-        return LoadedThread(thread, entries, parseMemory(reply["memory"] as? JsonObject), parseUsage(reply["usage"] as? JsonObject))
+        return LoadedThread(
+            thread,
+            entries,
+            parseMemory(reply["memory"] as? JsonObject),
+            parseUsage(reply["usage"] as? JsonObject),
+            parsePins(reply["pins"] as? JsonObject),
+            parsePins(reply["always"] as? JsonObject),
+            parseProjectMemory(reply["project_memory"] as? JsonObject)
+        )
     }
 
     /** Compact now. Waits for the server's Gemini call, so it gets a longer timeout than other requests. */
-    suspend fun compactThread(id: String): Pair<ThreadMemory?, TokenUse> {
+    suspend fun compactThread(id: String): Compacted {
         val reply = request("threads.compact", buildJsonObject { put("id", id) }, COMPACT_TIMEOUT_MS)
-        return parseMemory(reply["memory"] as? JsonObject) to parseUsage(reply["usage"] as? JsonObject)
+        return Compacted(parseMemory(reply["memory"] as? JsonObject), parseUsage(reply["usage"] as? JsonObject), parsePins(reply["pins"] as? JsonObject))
+    }
+
+    /** Sets the active project of the thread. `""` = none. */
+    suspend fun setThreadProject(id: String, project: String): ThreadInfo {
+        val reply = request("threads.set_project", buildJsonObject {
+            put("id", id)
+            put("project", project)
+        })
+        return parseThread(reply["thread"] as? JsonObject) ?: throw ServerErrorException("threads.set_project: no thread in reply")
     }
 
     /** Adds token counts to the thread's all-time use; returns the new totals. */
