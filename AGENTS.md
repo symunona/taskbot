@@ -1,166 +1,89 @@
-# Agent Instructions
+# Agent instructions
 
-This document provides instructions for AI agents operating in this codebase.
+Project: taltosbot. Overview, recipes, layout: `README.md`. Contract between parts: `docs/protocol.md`.
 
-## General Guidelines
+## Rules
 
-- **Ask for permission before executing a plan, except if it's explicitly written in the prompt to skip it.** The planning and the implementing phase should be human gated by default, but the human can owerwrite it!
+- Ask before executing a plan, unless the prompt says to skip that.
+- Doc style: terse keywords, bullets and tables over prose, complete facts, zero filler.
+- Protocol change: edit `docs/protocol.md` first, then code.
+- Use `just` recipes. New repeatable step: add a recipe, document it in `README.md`.
+- Not done until the linter is clean and a local build passed (see Done checklist).
+- Never commit `secrets/`, `dist/`, `config/build-node.env`, `server/config.toml`, API keys.
+- Never regenerate or overwrite `secrets/debug.keystore`. It is the app's install-over identity.
 
-## Rust Backend (`server/`)
+## Environment
 
-The default command and build runner for the Rust backend is **Cargo** (`cargo`).
+- `. tools/env.sh` before any bare `./gradlew`, `cargo`, `adb`, `keytool`. `just` recipes source it themselves.
+- Sets `JAVA_HOME`, `GRADLE_USER_HOME`, `CARGO_HOME`, `RUSTUP_HOME`, `TMPDIR`, `ANDROID_HOME`.
+- Caches and temp stay on the data SSD: `/mnt/data_ssd/cache`, `/mnt/data_ssd/tmp`.
+- Never write to `/tmp`, `~/.gradle`, `~/.cargo`, `~/.cache`. Temp files: `$TMPDIR`.
+- Reason: build and cache churn on the system SSD wore it out. See `/mnt/data_ssd/CLAUDE.md`.
+- Do not edit `tools/env.sh` to point anything back at `/`.
 
-### Important Commands
+## Server (`server/`, Rust)
 
-- **Build (Debug)**: `cd server && cargo build`
-- **Build (Release)**: `cd server && cargo build --release`
-- **Lint (Check)**: `cd server && cargo clippy`
-- **Lint (Auto-fix)**: `cd server && cargo clippy --fix --allow-dirty --allow-staged`
-- **Format**: `cd server && cargo fmt`
+| task | command |
+|---|---|
+| build | `just build-server` |
+| test | `just test-server` |
+| lint | `just lint-server` (`cargo fmt --check` + `cargo clippy --all-targets -- -D warnings`) |
+| format | `just fmt-server` |
+| clippy auto-fix | `. tools/env.sh && cargo clippy --manifest-path server/Cargo.toml --fix --allow-dirty --allow-staged` |
+| run | `just serve` |
 
-### General Rules
+- After each task: run the linter, fix every finding, then commit.
+- Do not ignore or silence linter warnings. Fix them.
+- Before calling a feature done: local build + tests.
 
-- **After each task, run the linter and fix issues before a fresh commit.**
-- Do not ignore linter warnings; fix them using `cargo clippy --fix` or manually apply the suggested changes before finishing the task.
-- Before calling a feature DONE, always do a local build to make sure it worked.
+## App (`app/`, `androidApp/`, Kotlin Multiplatform)
 
-## Android App (`androidApp/`)
+| task | command |
+|---|---|
+| debug APK, no version bump | `. tools/env.sh && ./gradlew :androidApp:assembleDebug` |
+| release APK into `dist/` | `just build-android-local` (or `just build-android` with a build node) |
+| web build | `just build-web` |
+| install on phone | `just install-apk` |
 
-### Skill: Android Test Cycle
+- Version: `version.properties`, written only by `tools/bump-version.sh`. Never hand-edit `versionCode` in Gradle.
+- An APK that goes to a phone or to the landing must come from `just build-android*`: bump, sidecar, verify.
+- `tools/verify-apk.sh` fails: do not deploy. Fix the cause (signer, version, sidecar).
 
-When debugging or testing the Android app, use this concise sequence to ensure a clean test cycle:
+Android test cycle:
 
-1. **Build and Install**: Compile and push the debug APK to the connected device/emulator.
-   ```bash
-   ./gradlew installDebug
-   ```
-2. **Clear Logs**: Clear the previous logcat buffer to avoid noise.
-   ```bash
-   adb logcat -c
-   ```
-3. **Start the App**: Launch the main activity.
-   ```bash
-   adb shell am start -n com.hermes.android/com.hermes.android.MainActivity
-   ```
-4. **Interact (Optional)**: Find coordinates of UI elements and simulate taps (e.g., Voice toggle).
-   ```bash
-   adb shell uiautomator dump && adb shell cat /sdcard/window_dump.xml | grep -o 'content-desc="Toggle Voice"[^>]*'
-   adb shell input tap <x> <y>
-   ```
-5. **Capture Logs**: Extract logs for analysis (filtering by specific tags like `EventLogger` or `Exception`).
-   ```bash
-   adb logcat -d | grep -i "EventLogger"
-   ```
+| step | command |
+|---|---|
+| build + install | `just build-android-local && just install-apk` |
+| clear logs | `adb logcat -c` |
+| start | `adb shell monkey -p <applicationId> -c android.intent.category.LAUNCHER 1` (`applicationId` in `androidApp/build.gradle.kts`) |
+| find a control | `adb shell uiautomator dump && adb shell cat /sdcard/window_dump.xml \| grep -o 'content-desc="<label>"[^>]*'` |
+| tap | `adb shell input tap <x> <y>` |
+| read logs | `adb logcat -d \| grep -i "<tag>"` |
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:full hash:d4f96305 -->
-## Issue Tracking with bd (beads)
+## Channel shim (`channel/`, Node)
 
-**IMPORTANT**: This project uses **bd (beads)** for ALL issue tracking. Do NOT use markdown TODOs, task lists, or other tracking methods.
+- Install deps: `just setup-channel`.
+- Server shells out to `channel/spawn-session.sh`. Interface: `docs/protocol.md` "Agent sessions".
 
-### Why bd?
+## Tooling (`justfile`, `tools/`)
 
-- Dependency-aware: Track blockers and relationships between issues
-- Git-friendly: Dolt-powered version control with native sync
-- Agent-optimized: JSON output, ready work detection, discovered-from links
-- Prevents duplicate tracking systems and confusion
+- After changing a script: `just lint-tools` (`bash -n` + `shellcheck`).
+- After changing the justfile: `just --list`, `just --dry-run <recipe>`.
+- Scripts source `tools/lib.sh`. Portable shell only: this host runs uutils coreutils (no `date +%3N`).
 
-### Quick Start
+## Remote hosts
 
-**Check for ready work:**
+| host | touched by | rule |
+|---|---|---|
+| build node (`config/build-node.env`) | `setup-build-node`, `build-android`, `build-android-remote` | no sudo, writes only under `$HOME`; `rsync --delete-after` only inside the workspace |
+| web host `taskbot` | `deploy-landing`, `release` | rsync into `~/wwwroot/taskbot.tmpx.space/` only, no `--delete` |
 
-```bash
-bd ready --json
-```
+- Run a deploy or a remote build only when the user asked for it.
 
-**Create new issues:**
+## Done checklist
 
-```bash
-bd create "Issue title" --description="Detailed context" -t bug|feature|task -p 0-4 --json
-bd create "Issue title" --description="What this issue is about" -p 1 --deps discovered-from:bd-123 --json
-```
-
-**Claim and update:**
-
-```bash
-bd update <id> --claim --json
-bd update bd-42 --priority 1 --json
-```
-
-**Complete work:**
-
-```bash
-bd close bd-42 --reason "Completed" --json
-```
-
-### Issue Types
-
-- `bug` - Something broken
-- `feature` - New functionality
-- `task` - Work item (tests, docs, refactoring)
-- `epic` - Large feature with subtasks
-- `chore` - Maintenance (dependencies, tooling)
-
-### Priorities
-
-- `0` - Critical (security, data loss, broken builds)
-- `1` - High (major features, important bugs)
-- `2` - Medium (default, nice-to-have)
-- `3` - Low (polish, optimization)
-- `4` - Backlog (future ideas)
-
-### Workflow for AI Agents
-
-1. **Check ready work**: `bd ready` shows unblocked issues
-2. **Claim your task atomically**: `bd update <id> --claim`
-3. **Work on it**: Implement, test, document
-4. **Discover new work?** Create linked issue:
-   - `bd create "Found bug" --description="Details about what was found" -p 1 --deps discovered-from:<parent-id>`
-5. **Complete**: `bd close <id> --reason "Done"`
-
-### Auto-Sync
-
-bd automatically syncs via Dolt:
-
-- Each write auto-commits to Dolt history
-- Use `bd dolt push`/`bd dolt pull` for remote sync
-- No manual export/import needed!
-
-### Important Rules
-
-- ✅ Use bd for ALL task tracking
-- ✅ Always use `--json` flag for programmatic use
-- ✅ Link discovered work with `discovered-from` dependencies
-- ✅ Check `bd ready` before asking "what should I work on?"
-- ❌ Do NOT create markdown TODO lists
-- ❌ Do NOT use external issue trackers
-- ❌ Do NOT duplicate tracking systems
-
-For more details, see README.md and docs/QUICKSTART.md.
-
-## Landing the Plane (Session Completion)
-
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd dolt push
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-
-<!-- END BEADS INTEGRATION -->
+1. `just lint-server` clean (server changed).
+2. `just test-server` passes (server changed).
+3. `just build-server` / Gradle build passes for what changed.
+4. `just lint-tools` clean (scripts changed).
+5. `README.md`, `docs/protocol.md` match the change.

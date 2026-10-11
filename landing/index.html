@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="Voice front end for your home machine. Talk on the phone, the work happens at home.">
+<title>taltosbot</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #f6f5f1;
+    --fg: #1b1c1a;
+    --muted: #62655f;
+    --line: #d9d7cf;
+    --accent: #1f5f4a;
+    --accent-fg: #ffffff;
+    --code-bg: #eae8e1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141614;
+      --fg: #e7e6e1;
+      --muted: #9a9d96;
+      --line: #2c302c;
+      --accent: #7fcfb0;
+      --accent-fg: #0f1a15;
+      --code-bg: #1f2320;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    justify-content: center;
+    background: var(--bg);
+    color: var(--fg);
+    font: 17px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main {
+    width: 100%;
+    max-width: 34rem;
+    padding: 18vh 1.25rem 4rem;
+  }
+  h1 {
+    margin: 0 0 .5rem;
+    font-size: 2rem;
+    font-weight: 650;
+    letter-spacing: -.02em;
+  }
+  .lede { margin: 0 0 2.25rem; color: var(--muted); }
+  .download {
+    display: block;
+    padding: .95rem 1.25rem;
+    border-radius: .6rem;
+    background: var(--accent);
+    color: var(--accent-fg);
+    font-size: 1.1rem;
+    font-weight: 600;
+    text-align: center;
+    text-decoration: none;
+  }
+  .download:hover { filter: brightness(1.08); }
+  .download:focus-visible, a:focus-visible { outline: 3px solid var(--fg); outline-offset: 3px; }
+  .meta {
+    min-height: 1.5em;
+    margin: .7rem 0 0;
+    color: var(--muted);
+    font-size: .875rem;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+  h2 {
+    margin: 3rem 0 .75rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: .8rem;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  ol { margin: 0; padding-left: 1.3rem; }
+  li { margin: .4rem 0; padding-left: .2rem; }
+  code {
+    padding: .1em .4em;
+    border-radius: .3rem;
+    background: var(--code-bg);
+    font: .9em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>taltosbot</h1>
+  <p class="lede">Voice front end for your home machine. Talk on the phone, the work happens at home.</p>
+
+  <a class="download" href="taltosbot.apk" download>Download APK</a>
+  <p class="meta" id="meta" aria-live="polite">Android</p>
+
+  <h2>Getting started</h2>
+  <ol>
+    <li>Install the APK on your phone.</li>
+    <li>Run <code>taltosbot pair</code> on the home machine.</li>
+    <li>Scan the QR code in the app.</li>
+  </ol>
+</main>
+<script>
+(function () {
+  var el = document.getElementById('meta');
+  function size(bytes) {
+    if (!(bytes > 0)) return null;
+    var mb = bytes / 1048576;
+    return (mb >= 10 ? Math.round(mb) : mb.toFixed(1)) + ' MB';
+  }
+  function date(iso) {
+    var d = new Date(iso);
+    if (isNaN(d)) return null;
+    try {
+      return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    } catch (e) {
+      return d.toISOString().slice(0, 10);
+    }
+  }
+  // Sidecar contract: docs/protocol.md "APK update". Any failure leaves the default text.
+  fetch('taltosbot.apk.json', { cache: 'no-store' })
+    .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(function (s) {
+      var parts = [];
+      if (s.version) parts.push('Version ' + s.version);
+      var sz = size(Number(s.size)); if (sz) parts.push(sz);
+      var dt = date(s.built_at); if (dt) parts.push('built ' + dt);
+      if (parts.length) el.textContent = parts.join(' · ');
+    })
+    .catch(function () {});
+})();
+</script>
+</body>
+</html>

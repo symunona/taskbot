@@ -12,7 +12,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="Hermes"
+        android:label="Taltosbot"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
@@ -29,12 +29,12 @@
         </activity>
         
         <service
-            android:name="com.hermes.voice.HermesVoiceService"
+            android:name="space.tmpx.taltosbot.voice.TaltosVoiceService"
             android:foregroundServiceType="microphone"
             android:exported="false" />
             
         <activity
-            android:name="com.hermes.ui.MyCaptureActivity"
+            android:name="space.tmpx.taltosbot.ui.MyCaptureActivity"
             android:screenOrientation="fullSensor"
             android:stateNotNeeded="true"
             android:theme="@style/zxing_CaptureTheme"

@@ -2,25 +2,24 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Hermes Alpha-B</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Taltosbot</title>
     <link rel="icon" href="favicon.png" type="image/png">
     <style>
-        body {
+        html, body {
             margin: 0;
             padding: 0;
-            background-color: #1e1e1e;
-            color: #ffffff;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        }
-        #root {
-            display: flex;
-            flex-direction: column;
-            height: 100vh;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #121212;
         }
     </style>
 </head>
 <body>
-    <div id="root"></div>
+    <!-- Compose draws into this canvas (CanvasBasedWindow's default id). skiko.js must load before app.js. -->
+    <canvas id="ComposeTarget"></canvas>
+    <script src="skiko.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

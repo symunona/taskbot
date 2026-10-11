@@ -1,0 +1,22 @@
+# taltosbot server, user unit. Template: `just install-server` fills @BIN@, @PATH@, @REPO@
+# and writes ~/.config/systemd/user/taltosbot.service. Edit the template, not the copy.
+[Unit]
+Description=taltosbot server (voice front end, home side)
+Documentation=file://@REPO@/docs/protocol.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@BIN@ serve
+# Config: ~/.config/taltosbot/config.toml. State: ~/.local/state/taltosbot/.
+# The server spawns agent sessions (tmux + node + claude), so PATH is pinned at install time.
+Environment=PATH=@PATH@
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=3
+# Agent sessions live in tmux and must outlive a server restart.
+KillMode=process
+
+[Install]
+WantedBy=default.target

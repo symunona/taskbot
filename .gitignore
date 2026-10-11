@@ -22,3 +22,14 @@ node_modules/
 
 # Dolt database files (added by bd init)
 .dolt/
+
+# taltosbot server: real config never tracked
+/server/config.toml
+
+# release plumbing: signing key, collected APK, machine-local build-node config
+/secrets/
+/dist/
+/config/build-node.env
+
+# app e2e: screenshots from e2e/web-check.sh
+/e2e/evidence/

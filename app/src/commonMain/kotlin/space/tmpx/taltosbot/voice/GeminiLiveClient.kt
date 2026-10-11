@@ -1,0 +1,285 @@
+package space.tmpx.taltosbot.voice
+
+import space.tmpx.taltosbot.ui.EventLogger
+import space.tmpx.taltosbot.ui.LogLevel
+import io.ktor.client.*
+import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.websocket.*
+import io.ktor.websocket.*
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import kotlin.io.encoding.Base64
+import kotlin.io.encoding.ExperimentalEncodingApi
+
+/**
+ * One Gemini Live socket. Single use: connect once, then disconnect.
+ *
+ * [onClosed] fires at most once, and only when the session ends on its own after setup
+ * (socket closed, receive error, or `goAway`) - not when [disconnect] is called.
+ */
+class GeminiLiveClient(
+    private val apiKey: String,
+    model: String,
+    private val onClosed: (reason: String) -> Unit
+) {
+    private val modelName = if (model.startsWith("models/")) model else "models/$model"
+
+    private val client = HttpClient {
+        install(HttpTimeout) {
+            requestTimeoutMillis = HttpTimeout.INFINITE_TIMEOUT_MS
+            connectTimeoutMillis = 10_000L
+            socketTimeoutMillis = HttpTimeout.INFINITE_TIMEOUT_MS
+        }
+        install(WebSockets) {
+            pingInterval = 20_000L
+        }
+    }
+
+    private var session: DefaultClientWebSocketSession? = null
+    private var receiveJob: Job? = null
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val json = Json { ignoreUnknownKeys = true }
+    private var setupComplete = CompletableDeferred<Unit>()
+    private var audioFrameCount = 0
+    private var setupDone = false
+    private var closing = false
+    private var closedReported = false
+
+    private val _incomingMessages = MutableSharedFlow<JsonObject>(extraBufferCapacity = 256)
+    val incomingMessages: SharedFlow<JsonObject> = _incomingMessages
+
+    /** Connection errors can quote the URL, which carries the key. */
+    fun redact(text: String): String = if (apiKey.isBlank()) text else text.replace(apiKey, "***")
+
+    /** After setup, tell the owner the session is over. Before setup, connect() throws instead. */
+    private fun reportClosed(reason: String) {
+        if (closing || closedReported || !setupDone) return
+        closedReported = true
+        onClosed(redact(reason))
+    }
+
+    suspend fun connect(systemInstruction: String? = null, tools: JsonArray? = null) {
+        // The key travels in the URL; never log the URL.
+        val url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=$apiKey"
+        EventLogger.log("GeminiLive: connecting (v1alpha, $modelName)")
+        session = try {
+            client.webSocketSession(url)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            throw RuntimeException(redact("GeminiLive: connect failed: ${e.message ?: e}"))
+        }
+        setupComplete = CompletableDeferred()
+
+        audioFrameCount = 0
+        receiveJob?.cancel()
+        receiveJob = scope.launch {
+            try {
+                for (frame in session!!.incoming) {
+                    val payload = when (frame) {
+                        is Frame.Text -> frame.readText()
+                        is Frame.Binary -> frame.readBytes().decodeToString()
+                        else -> continue
+                    }
+                    val message = json.parseToJsonElement(payload).jsonObject
+                    // Only log control messages, not audio data frames
+                    val hasAudio = message["serverContent"]?.jsonObject
+                        ?.get("modelTurn")?.jsonObject
+                        ?.get("parts") != null
+                    when {
+                        message["setupComplete"] != null -> {
+                            EventLogger.log("GeminiLive: setup complete")
+                            setupDone = true
+                            if (!setupComplete.isCompleted) {
+                                setupComplete.complete(Unit)
+                            }
+                        }
+                        message["goAway"] != null -> {
+                            val goAway = message["goAway"] as? JsonObject
+                            val detail = goAway?.get("reason")?.jsonPrimitive?.contentOrNull
+                                ?: goAway?.get("timeLeft")?.jsonPrimitive?.contentOrNull?.let { "time left $it" }
+                                ?: "server requested disconnect"
+                            EventLogger.log("GeminiLive: goAway: $detail", isError = true)
+                            if (!setupComplete.isCompleted) {
+                                setupComplete.completeExceptionally(RuntimeException("GeminiLive: goAway - $detail"))
+                            } else {
+                                reportClosed("Gemini ended the session (goAway: $detail)")
+                            }
+                        }
+                        message["toolCallCancellation"] != null -> {
+                            EventLogger.log("GeminiLive: tool call cancelled")
+                        }
+                        message["toolCall"] != null -> {
+                            EventLogger.log("GeminiLive: tool call received", level = LogLevel.DEBUG)
+                        }
+                        hasAudio -> {
+                            audioFrameCount++
+                            if (audioFrameCount % 50 == 1) {
+                                EventLogger.log("GeminiLive: audio frames received: $audioFrameCount", level = LogLevel.VERBOSE, collapseKey = "GeminiLive:frame")
+                            }
+                        }
+                        else -> {
+                            EventLogger.log("GeminiLive: frame ${message.keys} ${(message["serverContent"] as? JsonObject)?.keys ?: ""}", level = LogLevel.VERBOSE, collapseKey = "GeminiLive:frame")
+                        }
+                    }
+                    _incomingMessages.emit(message)
+                }
+                val reason = session?.closeReason?.await()
+                EventLogger.log("GeminiLive: channel closed. Reason: $reason")
+                val msg = reason?.message?.takeIf { it.isNotBlank() }
+                    ?: reason?.knownReason?.name
+                if (!setupComplete.isCompleted) {
+                    setupComplete.completeExceptionally(
+                        RuntimeException("GeminiLive: ${msg ?: "WebSocket closed before setup completed"}")
+                    )
+                } else {
+                    reportClosed("Gemini closed the connection" + (msg?.let { " ($it)" } ?: ""))
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                EventLogger.log(redact("GeminiLive: receive failed: ${e.message ?: e}"), isError = true)
+                if (!setupComplete.isCompleted) {
+                    setupComplete.completeExceptionally(e)
+                } else {
+                    reportClosed("Gemini connection lost (${e.message ?: e})")
+                }
+            }
+        }
+
+        val setupMessage = buildJsonObject {
+            put("setup", buildJsonObject {
+                put("model", modelName)
+                put("generationConfig", buildJsonObject {
+                    put("responseModalities", buildJsonArray { add(JsonPrimitive("AUDIO")) })
+                })
+                put("inputAudioTranscription", buildJsonObject {})
+                put("outputAudioTranscription", buildJsonObject {})
+                if (systemInstruction != null) {
+                    put("systemInstruction", buildJsonObject {
+                        put("parts", buildJsonArray {
+                            add(buildJsonObject { put("text", systemInstruction) })
+                        })
+                    })
+                }
+                if (tools != null && tools.isNotEmpty()) {
+                    put("tools", buildJsonArray {
+                        add(buildJsonObject {
+                            put("functionDeclarations", tools)
+                        })
+                    })
+                }
+            })
+        }
+
+        EventLogger.log(redact("GeminiLive: sending setup: ${setupMessage.toString().take(300)}"), level = LogLevel.DEBUG)
+        sendJson(setupMessage)
+        withTimeout(10_000L) {
+            setupComplete.await()
+        }
+    }
+
+    @OptIn(ExperimentalEncodingApi::class)
+    suspend fun sendAudio(pcmData: ByteArray) {
+        val base64Data = Base64.encode(pcmData)
+        sendJson(
+            buildJsonObject {
+                put("realtimeInput", buildJsonObject {
+                    put("audio", buildJsonObject {
+                        put("data", base64Data)
+                        put("mimeType", "audio/pcm;rate=16000")
+                    })
+                })
+            }
+        )
+    }
+
+    suspend fun endAudioStream() {
+        sendJson(
+            buildJsonObject {
+                put("realtimeInput", buildJsonObject {
+                    put("audioStreamEnd", true)
+                })
+            }
+        )
+    }
+
+    /**
+     * Injects a text turn the model answers out loud.
+     *
+     * Gemini 2.x live models take mid-session text as a `clientContent` turn. Later live models
+     * accept `clientContent` only for seeding history and want `realtimeInput.text` instead, so
+     * anything that is not a 2.x model gets that form. Not verified against a live socket.
+     */
+    suspend fun sendText(text: String) {
+        val message = if ("gemini-2" in modelName) {
+            buildJsonObject {
+                put("clientContent", buildJsonObject {
+                    put("turns", buildJsonArray {
+                        add(buildJsonObject {
+                            put("role", "user")
+                            put("parts", buildJsonArray { add(buildJsonObject { put("text", text) }) })
+                        })
+                    })
+                    put("turnComplete", true)
+                })
+            }
+        } else {
+            buildJsonObject {
+                put("realtimeInput", buildJsonObject { put("text", text) })
+            }
+        }
+        sendJson(message)
+    }
+
+    suspend fun sendToolResponse(functionResponses: JsonArray) {
+        sendJson(
+            buildJsonObject {
+                put("toolResponse", buildJsonObject {
+                    put("functionResponses", functionResponses)
+                })
+            }
+        )
+    }
+
+    private suspend fun sendJson(jsonObject: JsonObject) {
+        session?.send(Frame.Text(jsonObject.toString()))
+    }
+
+    fun disconnect(sendAudioStreamEnd: Boolean = false) {
+        closing = true
+        scope.launch {
+            try {
+                if (sendAudioStreamEnd) {
+                    endAudioStream()
+                }
+            } catch (_: Exception) {
+            }
+            try {
+                session?.close()
+            } catch (_: Exception) {
+            }
+            session = null
+            receiveJob?.cancel()
+            scope.cancel()
+        }
+    }
+}

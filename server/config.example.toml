@@ -1,0 +1,39 @@
+# taltosbot server config.
+# Location: $TALTOSBOT_CONFIG, else ~/.config/taltosbot/config.toml
+# Holds an API key: keep it mode 0600 and out of git.
+
+# Interface to bind. "0.0.0.0" = all. A specific non-loopback address also gets
+# a 127.0.0.1 listener, because the CLI and the channel shims talk to loopback.
+listen_addr = "0.0.0.0"
+listen_port = 55566
+
+# Vault root. Voice tools can only READ below this directory.
+vault_path = "/path/to/vault"
+
+# Live (voice) model.
+gemini_model = "gemini-2.5-flash-native-audio-preview-12-2025"
+# Text mode model.
+gemini_text_model = "gemini-flash-latest"
+# Thread memory compacts (server-side call). Default: gemini_text_model.
+# gemini_summary_model = "gemini-flash-lite-latest"
+
+# Directory holding spawn-session.sh (the `channel/` dir of the repo).
+# Without it, `delegate` returns an error.
+# channel_dir = "/path/to/repo/channel"
+channel_port_base = 55600
+
+# Extra URLs put first in pairing QR codes / server_urls (e.g. a reverse proxy).
+# public_urls = ["https://taltos.example.org"]
+
+[keys]
+# Handed to paired devices via GET /api/v1/config. $GEMINI_API_KEY overrides.
+gemini_api_key = ""
+
+# One table per project an agent session may be spawned in.
+# Name: letters, digits, "-" and "_" only (it becomes tmux session tb-<name>).
+# [projects.vault]
+# dir = "/path/to/vault"
+# permission_mode = "bypassPermissions"   # default: skips every permission prompt
+#                                          # (claude --dangerously-skip-permissions).
+#                                          # Others: acceptEdits, default, plan
+# model = "haiku"                         # optional: claude --model (alias or full id)
