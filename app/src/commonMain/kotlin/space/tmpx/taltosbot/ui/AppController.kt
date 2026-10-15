@@ -22,6 +22,7 @@ import space.tmpx.taltosbot.connection.TokenUse
 import space.tmpx.taltosbot.connection.ToolCall
 import space.tmpx.taltosbot.connection.parseConnectString
 import space.tmpx.taltosbot.connection.toJson
+import space.tmpx.taltosbot.connection.parseThread
 import space.tmpx.taltosbot.connection.upsertTask
 import space.tmpx.taltosbot.llm.GEMINI_BASE_URL
 import space.tmpx.taltosbot.llm.GeminiTextClient
@@ -70,6 +71,7 @@ const val SYSTEM_INSTRUCTION =
         "\"10-19 Finance\". Never read out server directories or full paths unless asked. " +
         "In tool calls use the exact path, numbers included. " +
         "Once the topic is clear, name the thread with `rename_thread` (a few words), without mentioning it. " +
+        "User wants a new thread or conversation, or to go back to another one: `switch_thread`. " +
         "User says remember / note / do not forget: `memory_note`, one short keyword line. Standing " +
         "rule for this conversation: `memory_note` too, without mentioning it. Always / everywhere / " +
         "from now on: scope `always`. Rule or fact of the project: scope `project`. Changed rule: " +
@@ -167,6 +169,8 @@ class AppController {
     private var voiceJob: Job? = null
     /** Thread that got the `voice_started` marker and still owes a `voice_ended`. */
     private var voiceMarkedThread: String? = null
+    /** Text turn for the next voice session once live: it came in through `switch_thread`. */
+    private var voiceSwitchNote: String? = null
 
     // Test seam: e2e points text mode at the mock server through this storage key. Unset = Google.
     private val textClient = GeminiTextClient(storage.getString(KEY_TEXT_BASE_URL)?.takeIf { it.isNotBlank() } ?: GEMINI_BASE_URL)
@@ -511,6 +515,37 @@ class AppController {
         }
     }
 
+    /**
+     * `switch_thread` came back: open [thread] as from the drawer. Voice live: this session ends, a
+     * new one starts on [thread] with its context. Text turn: it finishes on the old thread first.
+     */
+    private fun switchThread(thread: ThreadInfo, created: Boolean) {
+        val resumeVoice = voiceState != VoiceState.Idle
+        val turn = textJob
+        loadJob?.cancel()
+        threadLoading = true
+        loadJob = scope.launch {
+            try {
+                if (resumeVoice) stopVoice(note = null) else turn?.join()
+                val got = connection.getThread(thread.id)
+                showThread(got.thread, got.entries, got.memory, got.usage, got.pins, got.always, got.projectMemory)
+                threadsError = null
+                if (resumeVoice) {
+                    voiceSwitchNote = "[This is not the user speaking. The conversation just moved to " +
+                        (if (created) "a new thread" else "the thread") + " \"${got.thread.name}\". " +
+                        "Tell the user in a few words, then wait.]"
+                    startVoice()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                threadsError = "Thread did not open: ${e.message ?: e}"
+            } finally {
+                if (loadJob === coroutineContext.job) threadLoading = false
+            }
+        }
+    }
+
     fun renameThread(id: String, name: String) {
         val trimmed = name.trim()
         if (trimmed.isEmpty() || !requireConnected()) return
@@ -696,7 +731,12 @@ class AppController {
         putEntry(Entry(id, call.calledAt, EntryKind.TOOL, tool = call), threadId)
         runningTools = runningTools + id
         try {
-            connection.callTool(name, args, threadId).also(::finish)
+            connection.callTool(name, args, threadId).also { result ->
+                finish(result)
+                if (name == TOOL_SWITCH_THREAD) {
+                    parseThread(result["thread"] as? JsonObject)?.let { switchThread(it, created = result["created"] == JsonPrimitive(true)) }
+                }
+            }
         } catch (e: CancellationException) {
             finish(buildJsonObject { put("error", "cancelled") })
             throw e
@@ -854,6 +894,10 @@ class AppController {
                     voiceState = VoiceState.Active
                     voiceMarkedThread = thread.id
                     putEntry(Entry(newId("k"), now(), EntryKind.MARKER, MARKER_VOICE_STARTED), thread.id)
+                    voiceSwitchNote?.let {
+                        voiceSwitchNote = null
+                        session.sendText(it)
+                    }
                     // Gemini cuts a Live connection at ~10 min. Leave first, without an error.
                     launch {
                         delay(VOICE_MAX_MS)
@@ -875,6 +919,7 @@ class AppController {
         voiceSession = null
         voiceJob?.cancel()
         voiceJob = null
+        voiceSwitchNote = null // a switch whose voice start failed must not speak up later
         try {
             session?.stop()
         } catch (e: Throwable) {
@@ -923,6 +968,7 @@ class AppController {
         private const val FLUSH_DELAY_MS = 600L
         private const val VOICE_MAX_MS = 9 * 60_000L
         private const val TOOL_END_CONVERSATION = "end_conversation"
+        private const val TOOL_SWITCH_THREAD = "switch_thread"
         /** Slow enough that silence would sound like a hang. */
         private val SEARCH_TOOLS = setOf("web_search", "search_regexp")
         private const val FLUSH_RETRY_MS = 5_000L

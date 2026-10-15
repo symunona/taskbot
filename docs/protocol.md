@@ -307,6 +307,7 @@ Gemini gets read-only vault tools, web search, and session control. All writes g
 | `memory_forget` | `{match}` | `{forgotten, from, pins:[Pin], size, limit}`. Removes the one pin that contains `match`. `from` = `thread` / `project` / `always`, searched in that order. Pins only: never `## State`, `## Recent`, `## Tasks`. |
 | `memory_read` | `{thread?, project?}` | No arg: `{threads:[{id, name, project?, pins, memory}], projects:[name]}`: other threads that hold pins or a memory (newest `last_accessed_at` first, max 50; `pins` = count, `memory` = bool) + projects with a `.taskbot.md`. `thread` (id, or part of the name): `{thread:{id, name}, pins:[Pin], memory?}`, `memory` = memory text. `project`: `{project, text}`. Read-only. |
 | `set_project` | `{project}` | `{thread:Thread}`. Sets the active project of the thread in `tool.call.thread_id`; none → `{error}`. `""` = no project. Unknown name → `{error}` naming the projects. Pushes `threads.changed`. |
+| `switch_thread` | `{thread?, name?, project?}` | `{thread:Thread, created}`. `thread` (id, or part of its name) = open that thread, `created:false`. No `thread` = new thread: `name` (default `New thread`), `project` = its active project; `created:true`, pushes `threads.changed`. Calling thread, no match, several matches, unknown project, bad name → `{error}`. App opens the result thread, see below. |
 | `delegate` | `{project, prompt}` | `{status:"sent", project, task_id, state, queue_pos}`. Returns at once: `state` = `queued`. Progress: `tasks.changed`. Answer arrives later as `agent.say`. |
 | `web_search` | `{query}` | `{query, text, sources:[{title, uri}]}`. Server calls Gemini `generateContent` (`gemini_text_model`, tool `google_search`) with the server key. `text` = grounded answer. Max 8 sources. Server timeout 25 s. |
 | `end_conversation` | `{}` | `{status:"conversation_ended"}`. Server does nothing. App: voice running → stops the session once the result is stored, same as a mic tap. Not offered in text turns. |
@@ -357,6 +358,8 @@ Gemini gets read-only vault tools, web search, and session control. All writes g
 - `memory_note` scope `thread`, or `memory_forget`, without `tool.call.thread_id`: `thread` scope is skipped (`memory_note` → `{error}`). Scope `project` on a thread without an active project → `{error:"no active project"}`.
 - `memory_note` / `memory_forget` push: `thread` → `threads.memory`, `always` → `memory.always`, `project` → `memory.project`.
 - `memory_read` `thread`: one hit, else `{error}` naming the matches. The calling thread is left out of the list.
+- `switch_thread` `thread`: matched like `memory_read` `thread`. Server only creates or finds; the switch is the app's.
+- `switch_thread` in the app: the thread is opened as from the drawer. Voice live → session stops, thread opens, voice starts again on it (fresh context, a text turn says which thread). Text turn → the turn finishes on the old thread, then the thread opens.
 - `memory_read` `project`: `text` cut as in `ProjectMemory`. No usable file → `{error}`.
 
 ## Agent sessions

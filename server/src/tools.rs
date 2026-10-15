@@ -2,6 +2,7 @@
 //! `functionDeclarations[].parameters` shape. Vault tools only read. The
 //! `memory_*` tools write pins: sqlite, or the project's `.taskbot.md`.
 //! `end_conversation` is acted on by the app: here it only answers.
+//! `switch_thread` finds or creates the thread; the app opens it.
 
 use crate::server::App;
 use serde_json::{json, Value};
@@ -87,6 +88,19 @@ pub fn declarations() -> Vec<Value> {
             "Rename current conversation thread. Use when user asks, or topic became clear.",
             json!({"name": string("New title. Short, max 80 chars.")}),
             &["name"],
+        ),
+        decl(
+            "switch_thread",
+            "Move the user to another conversation thread. No thread: makes a new one and moves there; use when \
+             user asks for a new thread or conversation, or starts a clearly separate topic and wants it apart. \
+             thread: open that existing one. Voice restarts in the new thread with its own context: say nothing \
+             after the call. Not for renaming: rename_thread.",
+            json!({
+                "thread": string("Existing thread to open: id, or part of its name. Omit = new thread."),
+                "name": string("New thread only: short title. Omit = \"New thread\"."),
+                "project": string("New thread only: its active project, exact name from the projects tool."),
+            }),
+            &[],
         ),
         decl(
             "memory_note",
@@ -255,6 +269,20 @@ async fn run(
             let id = thread_id.ok_or("no thread_id in tool.call: no thread to rename")?;
             crate::server::rename_thread(app, id, text(args, "name")?)
         }
+        "switch_thread" => {
+            let (wanted, name, project) = (
+                optional(args, "thread"),
+                optional(args, "name"),
+                optional(args, "project"),
+            );
+            crate::memory::switch_thread(
+                app,
+                thread_id,
+                wanted.as_deref(),
+                name.as_deref(),
+                project.as_deref(),
+            )
+        }
         "memory_note" => {
             let text = text(args, "text")?.to_string();
             let (scope, replaces) = (optional(args, "scope"), optional(args, "replaces"));
@@ -322,6 +350,7 @@ mod tests {
                 "sessions",
                 "tasks",
                 "rename_thread",
+                "switch_thread",
                 "memory_note",
                 "memory_forget",
                 "memory_read",

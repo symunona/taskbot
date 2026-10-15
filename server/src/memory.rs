@@ -6,7 +6,7 @@
 use crate::now_ms;
 use crate::project_file::{self, Edit, PINNED};
 use crate::server::App;
-use crate::state::Pin;
+use crate::state::{self, Pin, Thread};
 use crate::tasks::{State, Task};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -596,7 +596,18 @@ pub fn read(
 /// `wanted` = a thread id, or part of a thread name. One hit, else an error
 /// that names the matches.
 fn read_thread(app: &App, wanted: &str) -> Result<Value, String> {
-    let thread = match app.store.thread_info(wanted).map_err(db)? {
+    let thread = find_thread(app, wanted)?;
+    let pins = app.store.pins(Some(&thread.id)).map_err(db)?;
+    let mut result = json!({"thread": {"id": thread.id, "name": thread.name}, "pins": pins});
+    if let Some((Some(memory), _)) = app.store.thread_memory(&thread.id).map_err(db)? {
+        result["memory"] = json!(memory.text);
+    }
+    Ok(result)
+}
+
+/// A thread by id, else the one thread whose name contains `wanted`, case ignored.
+fn find_thread(app: &App, wanted: &str) -> Result<Thread, String> {
+    Ok(match app.store.thread_info(wanted).map_err(db)? {
         Some(thread) => thread,
         None => {
             let needle = wanted.to_lowercase();
@@ -616,13 +627,45 @@ fn read_thread(app: &App, wanted: &str) -> Result<Value, String> {
             }
             hits.remove(0)
         }
-    };
-    let pins = app.store.pins(Some(&thread.id)).map_err(db)?;
-    let mut result = json!({"thread": {"id": thread.id, "name": thread.name}, "pins": pins});
-    if let Some((Some(memory), _)) = app.store.thread_memory(&thread.id).map_err(db)? {
-        result["memory"] = json!(memory.text);
+    })
+}
+
+/// The `switch_thread` tool. `caller` = the thread the call came from. Finds
+/// `wanted`, or makes a new thread; the app opens what comes back.
+pub fn switch_thread(
+    app: &App,
+    caller: Option<&str>,
+    wanted: Option<&str>,
+    name: Option<&str>,
+    project: Option<&str>,
+) -> Result<Value, String> {
+    if let Some(wanted) = wanted {
+        let thread = find_thread(app, wanted)?;
+        if caller == Some(thread.id.as_str()) {
+            return Err(format!("already in thread {:?}", thread.name));
+        }
+        return Ok(json!({"thread": thread, "created": false}));
     }
-    Ok(result)
+    // Checked before the create: a bad project leaves no orphan thread.
+    if let Some(project) = project {
+        if !app.cfg.projects.contains_key(project) {
+            return Err(unknown_project(app, project));
+        }
+    }
+    let name = match name {
+        Some(raw) => state::thread_name(raw)?,
+        None => state::THREAD_NAME_DEFAULT.to_string(),
+    };
+    let mut thread = app.store.create_thread(&name, now_ms()).map_err(db)?;
+    if let Some(project) = project {
+        thread = app
+            .store
+            .set_thread_project(&thread.id, Some(project))
+            .map_err(db)?
+            .ok_or_else(|| no_thread(&thread.id))?;
+    }
+    app.push("threads.changed", json!({ "thread": thread }));
+    Ok(json!({"thread": thread, "created": true}))
 }
 
 #[cfg(test)]

@@ -131,6 +131,7 @@ Targets: Android (voice + text), web (text only). Rules: `docs/protocol.md` "Thr
 - Every entry stored with `threads.append`, debounced 0.6 s, upsert by `id`. Offline: queued, sent on reconnect.
 - Stored tool result capped at 60k chars (`{truncated, chars, preview}`). The model gets the full result.
 - Last thread id remembered, reopened on connect. No thread: first message / voice start creates one.
+- `switch_thread` tool (new or existing thread): app opens it. Voice live → session restarts on that thread, says which one. Text turn → finishes on the old thread, then switches.
 - Disconnected: chat readable, send refused with a system note, draft kept.
 - Tasks: `tasks.list` on every connect, then `tasks.changed` pushes. Shown, never sent to Gemini: a text turn cuts into live speech. Model hears the answer (`agent.say`) and asks with the `tasks` tool. Rules: `docs/protocol.md` "Tasks".
 - Voice cues (synthesized, no assets): two-note tick when `web_search` / `search_regexp` starts, chime when `agent.say` arrives. The answer itself is queued: read out after the current speech has finished playing.

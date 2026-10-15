@@ -292,6 +292,7 @@ async fn pair_then_tools_and_agent_say() {
             "sessions",
             "tasks",
             "rename_thread",
+            "switch_thread",
             "memory_note",
             "memory_forget",
             "memory_read",
@@ -786,6 +787,95 @@ async fn threads_roundtrip() {
     )
     .await;
     assert_eq!(next(&mut watcher).await.unwrap()["event"], "agent.say");
+}
+
+#[tokio::test]
+async fn switch_thread_finds_or_creates() {
+    let env = boot(OK_SCRIPT, 55600).await;
+    let (token, _) = env.pair().await;
+    let mut ws = env.ws_authed(&token).await;
+    let (made, pushes) = request_with_pushes(
+        &mut ws,
+        "c1",
+        "threads.create",
+        json!({"name": "Garden plans"}),
+        "threads.create.result",
+    )
+    .await;
+    if pushes.is_empty() {
+        next_changed(&mut ws).await;
+    }
+    let garden = made["thread"]["id"].as_str().unwrap().to_string();
+
+    // No thread: a new one, named, with its project. Pushed like threads.create.
+    let (r, pushes) = request_with_pushes(
+        &mut ws,
+        "s1",
+        "tool.call",
+        json!({"name": "switch_thread", "args": {"name": "Taxes", "project": "demo"}, "thread_id": garden}),
+        "tool.result",
+    )
+    .await;
+    let made = r["result"].clone();
+    assert_eq!(made["created"], true, "{made}");
+    assert_eq!(made["thread"]["name"], "Taxes");
+    assert_eq!(made["thread"]["project"], "demo");
+    assert_ne!(made["thread"]["id"], garden);
+    let pushed = match pushes.first() {
+        Some(p) => p.clone(),
+        None => next_changed(&mut ws).await,
+    };
+    assert_eq!(pushed["thread"], made["thread"]);
+
+    // Defaults: no name, no project.
+    let (r, pushes) = request_with_pushes(
+        &mut ws,
+        "s2",
+        "tool.call",
+        json!({"name": "switch_thread", "args": {}, "thread_id": garden}),
+        "tool.result",
+    )
+    .await;
+    assert_eq!(r["result"]["thread"]["name"], "New thread");
+    assert!(r["result"]["thread"].get("project").is_none(), "{r}");
+    if pushes.is_empty() {
+        next_changed(&mut ws).await;
+    }
+
+    // Existing thread by part of its name, case ignored: found, nothing made.
+    let r = call_tool(&mut ws, "switch_thread", json!({"thread": "garden"})).await;
+    assert_eq!(r["created"], false, "{r}");
+    assert_eq!(r["thread"]["id"], garden.as_str());
+
+    // Errors, nothing made: the calling thread, no match, unknown project, empty name.
+    for (args, needle) in [
+        (json!({"thread": garden}), "already in"),
+        (json!({"thread": "nothing like it"}), "no thread matches"),
+        (json!({"project": "nope"}), "nope"),
+        (json!({"thread": "e"}), "threads match"),
+    ] {
+        let r = request(
+            &mut ws,
+            "s3",
+            "tool.call",
+            json!({"name": "switch_thread", "args": args, "thread_id": garden}),
+            "tool.result",
+        )
+        .await;
+        let error = r["result"]["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{r}"));
+        assert!(error.contains(needle), "{error}");
+    }
+    let list = request(
+        &mut ws,
+        "l1",
+        "threads.list",
+        json!({}),
+        "threads.list.result",
+    )
+    .await;
+    assert_eq!(list["threads"].as_array().unwrap().len(), 3);
 }
 
 #[tokio::test]
