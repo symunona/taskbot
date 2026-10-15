@@ -16,6 +16,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
@@ -31,8 +32,12 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlin.concurrent.Volatile
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
 
 data class VoiceTranscript(
     val role: String,
@@ -51,6 +56,8 @@ class VoiceSession(
     model: String,
     private val systemInstruction: String? = null,
     private val tools: JsonArray? = null,
+    /** Tool name -> sound played when the call starts. */
+    private val toolCues: Map<String, VoiceCue> = emptyMap(),
     private val executeTool: suspend (name: String, args: JsonObject) -> JsonObject,
     private val onEnded: (reason: String) -> Unit
 ) {
@@ -85,6 +92,19 @@ class VoiceSession(
     private val runningCalls = mutableMapOf<String, Deferred<JsonObject>>()
     /** Cancelled before the call got to run. */
     private val cancelledCalls = mutableSetOf<String>()
+
+    // Relays wait for a quiet moment: a text turn sent mid-speech cuts the speech off.
+    private val relayQueue = Channel<String>(capacity = Channel.UNLIMITED)
+    /** The model owes speech: it started a turn, or was just handed a tool result or a relay. */
+    @Volatile
+    private var turnOpen = false
+    /** Written under [toolLock]. */
+    @Volatile
+    private var toolBatchesInFlight = 0
+    @Volatile
+    private var lastModelActivity: TimeMark? = null
+    @Volatile
+    private var lastUserSpeech: TimeMark? = null
 
     private val _transcripts = MutableSharedFlow<VoiceTranscript>(extraBufferCapacity = 64)
     val transcripts: SharedFlow<VoiceTranscript> = _transcripts
@@ -127,6 +147,18 @@ class VoiceSession(
             }
         }
 
+        scope.launch {
+            for (text in relayQueue) {
+                awaitQuiet()
+                try {
+                    client.sendText(text)
+                    modelOwesSpeech() // the next relay waits for this one to be read out
+                } catch (t: Throwable) {
+                    EventLogger.log(client.redact("VoiceSession: relay send failed: ${t.message}"), isError = true)
+                }
+            }
+        }
+
         voiceManager.startRecording { audioData ->
             // Drop oldest if buffer full to prevent backpressure freeze
             audioOutChannel.trySend(audioData)
@@ -142,6 +174,38 @@ class VoiceSession(
             } catch (t: Throwable) {
                 EventLogger.log(client.redact("VoiceSession: text send failed: ${t.message}"), isError = true)
             }
+        }
+    }
+
+    /**
+     * Queues a text turn for Gemini to read out (an agent's answer). Announced by a cue at once,
+     * handed over when the current speech has finished playing. Several relays keep their order.
+     */
+    fun relay(text: String) {
+        voiceManager.playCue(VoiceCue.AGENT_REPLY)
+        relayQueue.trySend(text)
+    }
+
+    private fun modelOwesSpeech() {
+        turnOpen = true
+        lastModelActivity = TimeSource.Monotonic.markNow()
+    }
+
+    private fun within(mark: TimeMark?, ms: Long) = mark != null && mark.elapsedNow() < ms.milliseconds
+
+    private fun busy(): Boolean =
+        voiceManager.isPlaying.value ||
+            toolBatchesInFlight > 0 ||
+            within(lastUserSpeech, USER_QUIET_MS) ||
+            // A turn with no `turnComplete` must not hold the queue forever.
+            (turnOpen && within(lastModelActivity, TURN_STALL_MS))
+
+    /** Returns once nobody has been speaking, and no tool running, for [RELAY_SETTLE_MS]. */
+    private suspend fun awaitQuiet() {
+        var quietMs = 0L
+        while (quietMs < RELAY_SETTLE_MS) {
+            delay(RELAY_POLL_MS)
+            quietMs = if (busy()) 0L else quietMs + RELAY_POLL_MS
         }
     }
 
@@ -163,7 +227,10 @@ class VoiceSession(
             if (serverContent["interrupted"] != null) {
                 EventLogger.log("GeminiLive: response interrupted")
                 voiceManager.stopPlayback()
+                turnOpen = false
             }
+            if (serverContent["turnComplete"] != null) turnOpen = false
+            if (serverContent["inputTranscription"] != null) lastUserSpeech = TimeSource.Monotonic.markNow()
 
             emitTranscript(
                 role = "user",
@@ -181,6 +248,7 @@ class VoiceSession(
 
             val modelTurn = serverContent["modelTurn"]?.jsonObject
             val parts = modelTurn?.get("parts")?.jsonArray
+            if (parts != null) modelOwesSpeech()
             parts?.forEach { partElement ->
                 val part = partElement.jsonObject
 
@@ -199,29 +267,36 @@ class VoiceSession(
 
         if (toolCall != null) {
             val functionCalls = toolCall["functionCalls"]?.jsonArray ?: return
+            toolLock.withLock { toolBatchesInFlight++ }
             scope.launch {
-                val responses = buildJsonArray {
-                    functionCalls.forEach { functionCallElement ->
-                        val functionCall = functionCallElement.jsonObject
-                        val name = functionCall["name"]?.jsonPrimitive?.contentOrNull ?: return@forEach
-                        val callId = functionCall["id"]?.jsonPrimitive?.contentOrNull ?: return@forEach
-                        val args = functionCall["args"]?.jsonObject ?: buildJsonObject {}
-                        EventLogger.log("VoiceSession: tool call $name")
-                        val result = runCancellable(callId) { executeTool(name, args) }
-                        if (result == null) {
-                            EventLogger.log("VoiceSession: tool call $name cancelled, no response sent")
-                            return@forEach
+                try {
+                    val responses = buildJsonArray {
+                        functionCalls.forEach { functionCallElement ->
+                            val functionCall = functionCallElement.jsonObject
+                            val name = functionCall["name"]?.jsonPrimitive?.contentOrNull ?: return@forEach
+                            val callId = functionCall["id"]?.jsonPrimitive?.contentOrNull ?: return@forEach
+                            val args = functionCall["args"]?.jsonObject ?: buildJsonObject {}
+                            EventLogger.log("VoiceSession: tool call $name")
+                            toolCues[name]?.let(voiceManager::playCue)
+                            val result = runCancellable(callId) { executeTool(name, args) }
+                            if (result == null) {
+                                EventLogger.log("VoiceSession: tool call $name cancelled, no response sent")
+                                return@forEach
+                            }
+                            add(buildJsonObject {
+                                put("id", callId)
+                                put("name", name)
+                                put("response", result)
+                            })
                         }
-                        add(buildJsonObject {
-                            put("id", callId)
-                            put("name", name)
-                            put("response", result)
-                        })
                     }
-                }
-                if (responses.isNotEmpty()) {
-                    EventLogger.log("VoiceSession: sending tool response", level = LogLevel.DEBUG)
-                    client.sendToolResponse(responses)
+                    if (responses.isNotEmpty()) {
+                        EventLogger.log("VoiceSession: sending tool response", level = LogLevel.DEBUG)
+                        client.sendToolResponse(responses)
+                        modelOwesSpeech()
+                    }
+                } finally {
+                    withContext(NonCancellable) { toolLock.withLock { toolBatchesInFlight-- } }
                 }
             }
         }
@@ -281,7 +356,16 @@ class VoiceSession(
         voiceManager.stopRecording()
         voiceManager.stopPlayback()
         audioOutChannel.close()
+        relayQueue.close()
         client.disconnect(sendAudioStreamEnd = true)
         scope.cancel()
+    }
+
+    private companion object {
+        const val RELAY_POLL_MS = 100L
+        const val RELAY_SETTLE_MS = 400L
+        /** Input transcripts trail the voice; inside this window the user may still be talking. */
+        const val USER_QUIET_MS = 2_000L
+        const val TURN_STALL_MS = 5_000L
     }
 }

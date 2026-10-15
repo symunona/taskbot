@@ -90,7 +90,7 @@ Server push, no `ref_id`:
 
 | event | payload | app does |
 |---|---|---|
-| `agent.say` | `{project, text}` | live voice: inject as text turn so Gemini speaks it. Else: chat bubble. |
+| `agent.say` | `{project, text}` | live voice: chime at once, then queued. Injected as text turn (Gemini speaks it) when current speech has finished playing and no tool runs; several keep order. Else: chat bubble. |
 | `agent.event` | `{project, kind, detail}` | log. Later: earcons. `kind` = `spawned`, `prompt`, `start`, `activity`, `waiting`, `resume`, `stop`, `error`. |
 | `tasks.changed` | `{task:Task}` | upsert by `task.id`, redraw. UI only: never injected into the voice model. |
 | `threads.changed` | `{thread:Thread}` | update thread list + title. Sent on create, rename, active project change. |

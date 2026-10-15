@@ -45,18 +45,32 @@ fun ChatScreen(controller: AppController) {
     val entries = controller.entries
     val listState = rememberLazyListState()
 
-    // Auto-scroll to bottom when entries change, if near the bottom
-    LaunchedEffect(entries.size, entries.lastOrNull()?.text?.length, controller.textBusy) {
-        val layoutInfo = listState.layoutInfo
-        val lastVisibleIndex = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-        val totalItems = layoutInfo.totalItemsCount
-        if (totalItems > 0 && totalItems - lastVisibleIndex <= 3) {
-            listState.animateScrollToItem(totalItems - 1)
+    // Follow the end, unless the user scrolled up to read. Back at the end: following again.
+    var follow by remember { mutableStateOf(true) }
+    // Past the end of the last row: a long bubble shows its newest lines, not its top.
+    suspend fun scrollToEnd() {
+        val rows = entries.size + if (controller.textBusy) 1 else 0
+        if (rows > 0) listState.scrollToItem(rows - 1, Int.MAX_VALUE)
+    }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+            if (!scrolling) follow = !listState.canScrollForward
         }
+    }
+    // Content changed: new entry, a growing transcript, a tool result, the thinking row.
+    LaunchedEffect(entries.size, entries.lastOrNull(), controller.textBusy) {
+        // Own message: always shown, wherever the list was.
+        if (entries.lastOrNull()?.kind == EntryKind.USER) follow = true
+        if (follow) scrollToEnd()
+    }
+    // Keyboard opened or the task strip grew: the list got shorter.
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.layoutInfo.viewportSize.height }.collect { if (follow) scrollToEnd() }
     }
     // Another thread opened: start at its end.
     LaunchedEffect(controller.currentThread?.id) {
-        if (entries.isNotEmpty()) listState.scrollToItem(entries.size - 1)
+        follow = true
+        scrollToEnd()
     }
 
     Column(modifier = Modifier.fillMaxSize()) {

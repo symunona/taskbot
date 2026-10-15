@@ -19,4 +19,5 @@ actual class VoiceManager {
     actual fun stopRecording() {}
     actual fun playAudio(pcmData: ByteArray) {}
     actual fun stopPlayback() {}
+    actual fun playCue(cue: VoiceCue) {}
 }

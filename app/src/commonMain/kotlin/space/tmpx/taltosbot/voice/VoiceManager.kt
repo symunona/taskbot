@@ -5,6 +5,7 @@ import kotlinx.coroutines.flow.StateFlow
 
 expect class VoiceManager() {
     val isRecording: StateFlow<Boolean>
+    /** True while speech is queued or still coming out of the speaker. */
     val isPlaying: StateFlow<Boolean>
     
     fun startRecording(onAudioData: (ByteArray) -> Unit)
@@ -12,4 +13,7 @@ expect class VoiceManager() {
     
     fun playAudio(pcmData: ByteArray)
     fun stopPlayback()
+
+    /** Plays next to speech, never instead of it. */
+    fun playCue(cue: VoiceCue)
 }

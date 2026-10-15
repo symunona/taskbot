@@ -34,6 +34,7 @@ import space.tmpx.taltosbot.llm.textSystemInstruction
 import space.tmpx.taltosbot.llm.voiceSystemInstruction
 import space.tmpx.taltosbot.update.UpdateInfo
 import space.tmpx.taltosbot.update.checkForUpdate
+import space.tmpx.taltosbot.voice.VoiceCue
 import space.tmpx.taltosbot.voice.VoiceSession
 import space.tmpx.taltosbot.voice.VoiceTranscript
 import kotlinx.coroutines.CancellationException
@@ -264,9 +265,10 @@ class AppController {
             is ServerPush.AgentSay -> {
                 // Entry id from the envelope id: the same push stored by two devices lands once.
                 putEntry(Entry(push.id?.let { "a-$it" } ?: newId("a"), now(), EntryKind.AGENT, push.text, project = push.project))
-                // Live voice: Gemini reads it out. Otherwise the bubble above is all there is.
+                // Live voice: a chime now, then Gemini reads it out once it has finished speaking.
+                // Otherwise the bubble above is all there is.
                 if (voiceState == VoiceState.Active) {
-                    voiceSession?.sendText(
+                    voiceSession?.relay(
                         "[This is not the user speaking. It is a message from the agent working on project " +
                             "\"${push.project}\", answering an earlier delegated request. Relay it to the user " +
                             "now, briefly, in the language you are speaking with them.]\n\n${push.text}"
@@ -826,6 +828,7 @@ class AppController {
                 // What was typed or said before on this thread rides along: memory + transcript block.
                 systemInstruction = instruction,
                 tools = connection.tools.value,
+                toolCues = SEARCH_TOOLS.associateWith { VoiceCue.SEARCH },
                 executeTool = { name, args ->
                     runTool(thread.id, name, args).also {
                         // The model asked to hang up. Its call is stored; the session goes down like a mic tap.
@@ -920,6 +923,8 @@ class AppController {
         private const val FLUSH_DELAY_MS = 600L
         private const val VOICE_MAX_MS = 9 * 60_000L
         private const val TOOL_END_CONVERSATION = "end_conversation"
+        /** Slow enough that silence would sound like a hang. */
+        private val SEARCH_TOOLS = setOf("web_search", "search_regexp")
         private const val FLUSH_RETRY_MS = 5_000L
         private const val APPEND_MAX_ENTRIES = 200
         private const val APPEND_MAX_BYTES = 600_000

@@ -29,6 +29,10 @@ actual class VoiceManager {
     private val playbackChannel = Channel<ByteArray>(capacity = Channel.UNLIMITED)
     private val scope = CoroutineScope(Dispatchers.IO + Job())
 
+    /** Frames handed to the track since the last flush. The track's head position counts from the same point. */
+    @Volatile
+    private var framesWritten = 0L
+
     actual fun startRecording(onAudioData: (ByteArray) -> Unit) {
         if (_isRecording.value) return
 
@@ -113,10 +117,29 @@ actual class VoiceManager {
         if (playbackJob == null || playbackJob?.isActive != true) {
             audioTrack?.play() // resume if paused by stopPlayback()
             playbackJob = scope.launch {
-                _isPlaying.value = true
+                var lastHead = -1L
+                var stalledPolls = 0
                 try {
-                    for (chunk in playbackChannel) {
-                        audioTrack?.write(chunk, 0, chunk.size)
+                    while (isActive) {
+                        // Queue empty while speaking: poll until the track has played out what it was given.
+                        val chunk = playbackChannel.tryReceive().getOrNull()
+                            ?: if (_isPlaying.value) {
+                                withTimeoutOrNull(DRAIN_POLL_MS) { playbackChannel.receive() }
+                            } else {
+                                playbackChannel.receive()
+                            }
+                        if (chunk == null) {
+                            val head = (audioTrack?.playbackHeadPosition ?: 0).toLong() and 0xFFFFFFFFL
+                            // A head that stopped moving short of the end is an underrun: nothing more will come out.
+                            stalledPolls = if (head == lastHead) stalledPolls + 1 else 0
+                            lastHead = head
+                            if (head >= framesWritten || stalledPolls >= DRAIN_STALL_POLLS) _isPlaying.value = false
+                            continue
+                        }
+                        _isPlaying.value = true
+                        stalledPolls = 0
+                        val written = audioTrack?.write(chunk, 0, chunk.size) ?: 0
+                        if (written > 0 && isActive) framesWritten += written / BYTES_PER_FRAME
                     }
                 } finally {
                     _isPlaying.value = false
@@ -137,7 +160,42 @@ actual class VoiceManager {
         // Pause + flush hardware buffer for immediate silence
         audioTrack?.pause()
         audioTrack?.flush()
+        framesWritten = 0L // flush resets the head position too
         _isPlaying.value = false
         // Keep AudioTrack alive - playAudio() will resume it
+    }
+
+    actual fun playCue(cue: VoiceCue) {
+        val pcm = cuePcm(cue)
+        scope.launch {
+            var track: AudioTrack? = null
+            try {
+                // Own static track: mixed with the speech stream, and stopPlayback() does not cut it.
+                track = AudioTrack(
+                    AudioManager.STREAM_MUSIC,
+                    CUE_SAMPLE_RATE,
+                    AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    pcm.size,
+                    AudioTrack.MODE_STATIC
+                )
+                track.write(pcm, 0, pcm.size)
+                track.play()
+                delay(pcm.size * 1000L / (CUE_SAMPLE_RATE * BYTES_PER_FRAME) + CUE_TAIL_MS)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                EventLogger.log("VoiceManager: cue $cue failed: ${e.message ?: e}", isError = true)
+            } finally {
+                track?.release()
+            }
+        }
+    }
+
+    private companion object {
+        const val BYTES_PER_FRAME = 2 // PCM16 mono
+        const val DRAIN_POLL_MS = 40L
+        const val DRAIN_STALL_POLLS = 8
+        const val CUE_TAIL_MS = 150L
     }
 }

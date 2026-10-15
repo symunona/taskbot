@@ -133,6 +133,7 @@ Targets: Android (voice + text), web (text only). Rules: `docs/protocol.md` "Thr
 - Last thread id remembered, reopened on connect. No thread: first message / voice start creates one.
 - Disconnected: chat readable, send refused with a system note, draft kept.
 - Tasks: `tasks.list` on every connect, then `tasks.changed` pushes. Shown, never sent to Gemini: a text turn cuts into live speech. Model hears the answer (`agent.say`) and asks with the `tasks` tool. Rules: `docs/protocol.md` "Tasks".
+- Voice cues (synthesized, no assets): two-note tick when `web_search` / `search_regexp` starts, chime when `agent.say` arrives. The answer itself is queued: read out after the current speech has finished playing.
 
 Web smoke check, no real server, no Gemini:
 
